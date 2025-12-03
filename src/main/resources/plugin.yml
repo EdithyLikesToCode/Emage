@@ -1,0 +1,17 @@
+name: Emage
+version: ${project.version}
+main: org.flowerion.emage.EmagePlugin
+description: Emage is the lightest way to display high-quality images on item frames. Zero lag, auto-resizing, and 1.21 support.
+api-version: '1.18'
+authors: [EdithyMaster]
+
+commands:
+  emage:
+    description: Apply an image or GIF to Item Frames
+    permission: emage.use
+
+permissions:
+  emage.use:
+    default: true
+  emage.admin:
+    default: op

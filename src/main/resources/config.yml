@@ -1,0 +1,51 @@
+# Emage Configuration
+
+check-updates: true
+
+performance:
+  # Enables adaptive performance (automatically adjusts based on load)
+  adaptive: true
+
+  # Maximum gif FPS (Anything above 60 is NOT recommended)
+  max-fps: 60
+
+  # Minimum gif FPS
+  min-fps: 20
+
+  # Maximum render distance for gifs/images (blocks)
+  max-render-distance: 96
+
+memory:
+  # Use memory pooling for byte arrays (reduces GC pressure)
+  use-pool: true
+
+  # Maximum pool size
+  pool-size: 100
+
+  # Maximum memory usage for MB (soft limit for adaptive scaling)
+  max-usage-mb: 256
+
+quality:
+  # Maximum frames to load from a GIF
+  max-gif-frames: 200
+
+  # Maximum grid size (e.g., 15 = 15x15 max)
+  max-grid-size: 15
+
+messages:
+  # Processing
+  detected: "&6Detected grid: <width>x<height> &7(facing <facing>, quality: <quality>)"
+  processing-gif: "&6Processing GIF for <width>x<height> grid... Please wait."
+
+  # Success
+  success: "&aSuccessfully applied image to &b<total>&a frame(s)!"
+  success-gif: "&aApplied GIF to <total> frame(s) &7(<frames> frames in <time>ms)"
+
+  # Admin
+  migrate-start: "&7Starting migration..."
+  migrated: "&aMigrated &b<count>&a file(s) to optimized format."
+  reloaded: "&aConfiguration reloaded!"
+  cleanup-start: "&7Scanning for unused files..."
+  cleanup-scanning: "&7Found &b<count> &7maps in use, checking files..."
+  cleanup-done: "&aDeleted &b<count> &aunused file(s)"
+  stats: "&7Stats: &b<static> &7static, &b<anim> &7animations, &b<size> &7total, &b<active> &7active"
