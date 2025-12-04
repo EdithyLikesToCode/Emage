@@ -1,8 +1,7 @@
-package org.flowerion.emage.Config;
+package org.flowerion.emage;
 
 import org.bukkit.Bukkit;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.flowerion.emage.Processing.EmageCore;
 
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;

@@ -1,4 +1,4 @@
-package org.flowerion.emage.Processing;
+package org.flowerion.emage;
 
 import java.io.*;
 import java.util.*;
