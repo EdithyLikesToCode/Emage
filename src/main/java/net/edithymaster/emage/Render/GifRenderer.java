@@ -1,14 +1,15 @@
-package org.flowerion.emage.Render;
+package net.edithymaster.emage.Render;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
+import org.bukkit.World;
 import org.bukkit.entity.Player;
 import org.bukkit.map.MapCanvas;
 import org.bukkit.map.MapRenderer;
 import org.bukkit.map.MapView;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.flowerion.emage.Config.EmageConfig;
-import org.flowerion.emage.Processing.EmageCore;
+import net.edithymaster.emage.Config.EmageConfig;
+import net.edithymaster.emage.Processing.EmageCore;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -17,14 +18,18 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class GifRenderer extends MapRenderer {
 
     private static final Map<Long, SyncGroup> SYNC_GROUPS = new ConcurrentHashMap<>();
-
     private static final Map<Integer, GifRenderer> RENDERERS = new ConcurrentHashMap<>();
+    private static final Map<Integer, Location> MAP_LOCATIONS = new ConcurrentHashMap<>();
 
     private static volatile boolean running = false;
     private static JavaPlugin plugin;
     private static EmageConfig config;
 
     private static final AtomicInteger ID_COUNTER = new AtomicInteger(0);
+
+    private static final int DEFAULT_RENDER_DISTANCE_SQ = 64 * 64;
+
+    private static final List<GifRenderer> DIRTY_BUFFER = new ArrayList<>();
 
     private final int id;
     private final long syncId;
@@ -36,34 +41,38 @@ public final class GifRenderer extends MapRenderer {
     private volatile boolean needsRender = true;
 
     private static class SyncGroup {
-        final long syncId;
+        final long syncID;
         final Set<GifRenderer> renderers = ConcurrentHashMap.newKeySet();
         final int[] delays;
         final long totalDuration;
         final int frameCount;
 
+        final long[] cumulativeDelays;
+
         volatile long startTime = 0;
         volatile int currentFrame = 0;
         volatile boolean active = false;
-        volatile long lastFrameChangeTime = 0;
 
-        SyncGroup(long syncId, List<Integer> delayList) {
-            this.syncId = syncId;
+        SyncGroup(long syncID, List<Integer> delayList) {
+            this.syncID = syncID;
             this.frameCount = delayList != null ? delayList.size() : 0;
 
             if (frameCount == 0) {
                 this.delays = new int[0];
+                this.cumulativeDelays = new long[0];
                 this.totalDuration = 1;
                 return;
             }
 
             this.delays = new int[frameCount];
+            this.cumulativeDelays = new long[frameCount];
             long total = 0;
             for (int i = 0; i < frameCount; i++) {
                 int delay = delayList.get(i);
-                delay = Math.max(50, delay);
+                delay = Math.max(20, delay);
                 this.delays[i] = delay;
                 total += delay;
+                this.cumulativeDelays[i] = total;
             }
             this.totalDuration = Math.max(1, total);
         }
@@ -72,7 +81,6 @@ public final class GifRenderer extends MapRenderer {
             this.startTime = System.currentTimeMillis();
             this.currentFrame = 0;
             this.active = true;
-            this.lastFrameChangeTime = startTime;
             markAllDirty();
         }
 
@@ -86,24 +94,29 @@ public final class GifRenderer extends MapRenderer {
             long elapsed = now - startTime;
             long cyclePosition = elapsed % totalDuration;
 
-            int targetFrame = 0;
-            long accumulated = 0;
-            for (int i = 0; i < frameCount; i++) {
-                accumulated += delays[i];
-                if (cyclePosition < accumulated) {
-                    targetFrame = i;
-                    break;
-                }
-            }
+            int targetFrame = findFrame(cyclePosition);
 
             if (targetFrame != currentFrame) {
                 currentFrame = targetFrame;
-                lastFrameChangeTime = now;
                 markAllDirty();
                 return true;
             }
 
             return false;
+        }
+
+        private int findFrame(long cyclePosition) {
+            int lo = 0, hi = frameCount - 1;
+            while (lo < hi) {
+                int mid = (lo + hi) >>> 1;
+                if (cumulativeDelays[mid] <= cyclePosition) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+
+            return lo;
         }
 
         void markAllDirty() {
@@ -124,13 +137,14 @@ public final class GifRenderer extends MapRenderer {
         if (running) return;
         running = true;
 
-        Bukkit.getScheduler().runTaskTimer(plugin, GifRenderer::tick, 2L, 2L);
+        Bukkit.getScheduler().runTaskTimer(plugin, GifRenderer::tick, 1L, 1L);
     }
 
     public static void stop() {
         running = false;
         SYNC_GROUPS.clear();
         RENDERERS.clear();
+        MAP_LOCATIONS.clear();
     }
 
     private static void tick() {
@@ -138,39 +152,69 @@ public final class GifRenderer extends MapRenderer {
 
         long now = System.currentTimeMillis();
 
+        boolean anyChanged = false;
         for (SyncGroup group : SYNC_GROUPS.values()) {
-            group.tick(now);
+            if (group.tick(now)) {
+                anyChanged = true;
+            }
         }
 
-        sendMapUpdates();
+        if (anyChanged) {
+            sendMapUpdates();
+        }
     }
 
     private static void sendMapUpdates() {
         Collection<? extends Player> players = Bukkit.getOnlinePlayers();
         if (players.isEmpty()) return;
 
-        List<GifRenderer> dirtyRenderers = new ArrayList<>();
+        DIRTY_BUFFER.clear();
         for (GifRenderer renderer : RENDERERS.values()) {
             if (renderer.needsRender && renderer.mapView != null) {
-                dirtyRenderers.add(renderer);
+                DIRTY_BUFFER.add(renderer);
             }
         }
 
-        if (dirtyRenderers.isEmpty()) return;
+        if (DIRTY_BUFFER.isEmpty()) return;
+
+        int renderDistSq = config != null ? config.getRenderDistanceSquared() : DEFAULT_RENDER_DISTANCE_SQ;
+        int perPlayerBudget = config != null ? config.getMaxPacketsPerTick() : 80;
 
         for (Player player : players) {
             if (!player.isOnline()) continue;
 
-            for (GifRenderer renderer : dirtyRenderers) {
+            Location playerLoc = player.getLocation();
+            World playerWorld = player.getWorld();
+            int sent = 0;
+
+            for (int i = 0, size = DIRTY_BUFFER.size(); i < size; i++) {
+                if (sent >= perPlayerBudget) break;
+
+                GifRenderer renderer = DIRTY_BUFFER.get(i);
+
+                @SuppressWarnings("deprecation")
+                int mapID = renderer.mapView.getId();
+                Location mapLoc = MAP_LOCATIONS.get(mapID);
+
+                if (mapLoc != null) {
+                    if (!playerWorld.equals(mapLoc.getWorld())) continue;
+                    if (playerLoc.distanceSquared(mapLoc) > renderDistSq) continue;
+                }
+
                 try {
                     player.sendMap(renderer.mapView);
+                    sent++;
                 } catch (Exception ignored) {}
             }
         }
+
+        for (int i = 0, size = DIRTY_BUFFER.size(); i < size; i++) {
+            DIRTY_BUFFER.get(i).needsRender = false;
+        }
     }
 
-    public static void startSyncGroup(long syncId) {
-        SyncGroup group = SYNC_GROUPS.get(syncId);
+    public static void startSyncGroup(long syncID) {
+        SyncGroup group = SYNC_GROUPS.get(syncID);
         if (group != null) {
             group.start();
         }
@@ -183,27 +227,29 @@ public final class GifRenderer extends MapRenderer {
         }
     }
 
-    public static void registerMapLocation(int mapId, Location location) {}
+    public static void registerMapLocation(int mapId, Location location) {
+        if (location != null) {
+            MAP_LOCATIONS.put(mapId, location.clone());
+        }
+    }
 
     public static int getActiveCount() {
         return RENDERERS.size();
     }
 
-    public GifRenderer(List<byte[]> frameList, List<Integer> delays, long syncId) {
+    public GifRenderer(List<byte[]> frameList, List<Integer> delays, long syncID) {
         super(false);
 
         this.id = ID_COUNTER.incrementAndGet();
-        this.syncId = syncId;
+        this.syncId = syncID;
         this.frameCount = frameList.size();
 
         this.frames = new byte[frameCount][];
         for (int i = 0; i < frameCount; i++) {
-            byte[] src = frameList.get(i);
-            this.frames[i] = new byte[src.length];
-            System.arraycopy(src, 0, this.frames[i], 0, src.length);
+            this.frames[i] = frameList.get(i);
         }
 
-        SyncGroup group = SYNC_GROUPS.computeIfAbsent(syncId, k -> new SyncGroup(syncId, delays));
+        SyncGroup group = SYNC_GROUPS.computeIfAbsent(syncID, k -> new SyncGroup(syncID, delays));
         group.renderers.add(this);
 
         if (config != null) {
@@ -224,8 +270,8 @@ public final class GifRenderer extends MapRenderer {
     }
 
     private static List<Integer> createDelayList(int size, int delay) {
-        List<Integer> delays = new ArrayList<>(size);
         int clamped = Math.max(50, delay);
+        List<Integer> delays = new ArrayList<>(size);
         for (int i = 0; i < size; i++) {
             delays.add(clamped);
         }
@@ -237,8 +283,8 @@ public final class GifRenderer extends MapRenderer {
         if (this.mapView == null) {
             this.mapView = map;
             @SuppressWarnings("deprecation")
-            int mapId = map.getId();
-            RENDERERS.put(mapId, this);
+            int mapID = map.getId();
+            RENDERERS.put(mapID, this);
         }
 
         SyncGroup group = SYNC_GROUPS.get(syncId);
@@ -265,7 +311,6 @@ public final class GifRenderer extends MapRenderer {
         }
 
         lastRenderedFrame = frameIndex;
-        needsRender = false;
     }
 
     public void remove() {
@@ -279,8 +324,9 @@ public final class GifRenderer extends MapRenderer {
 
         if (mapView != null) {
             @SuppressWarnings("deprecation")
-            int mapId = mapView.getId();
-            RENDERERS.remove(mapId);
+            int mapID = mapView.getId();
+            RENDERERS.remove(mapID);
+            MAP_LOCATIONS.remove(mapID);
         }
 
         if (config != null) {
@@ -314,13 +360,7 @@ public final class GifRenderer extends MapRenderer {
     }
 
     public List<byte[]> getFrames() {
-        List<byte[]> list = new ArrayList<>(frameCount);
-        for (byte[] frame : frames) {
-            byte[] copy = new byte[frame.length];
-            System.arraycopy(frame, 0, copy, 0, frame.length);
-            list.add(copy);
-        }
-        return list;
+        return Collections.unmodifiableList(Arrays.asList(frames));
     }
 
     public List<Integer> getDelays() {

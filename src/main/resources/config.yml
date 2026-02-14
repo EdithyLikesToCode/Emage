@@ -1,51 +1,194 @@
-# Emage Configuration
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#              Emage Configuration
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# Check for plugin updates on startup and periodically
 check-updates: true
 
+# ─────────────────────────────────────────────────
+#  Performance
+# ─────────────────────────────────────────────────
+
 performance:
-  # Enables adaptive performance (automatically adjusts based on load)
+  # Automatically adjust FPS, render distance, and update
+  # interval based on player count, map count, and memory usage
   adaptive: true
 
-  # Maximum gif FPS (Anything above 60 is NOT recommended)
+  # GIF animation frame rate limits
+  # Values above 60 are NOT recommended
   max-fps: 60
-
-  # Minimum gif FPS
   min-fps: 20
 
-  # Maximum render distance for gifs/images (blocks)
-  max-render-distance: 96
+  # Maximum distance (in blocks) at which animated maps
+  # will send frame updates to players
+  # Lower = less bandwidth, higher = visible from further away
+  max-render-distance: 64
+
+  # Maximum map update packets sent per player per tick
+  # Lower = less lag spikes, higher = smoother animations with many maps
+  max-packets-per-tick: 60
+
+# ─────────────────────────────────────────────────
+#  Memory
+# ─────────────────────────────────────────────────
 
 memory:
-  # Use memory pooling for byte arrays (reduces GC pressure)
+  # Reuse byte arrays instead of allocating new ones
+  # Significantly reduces garbage collection pauses during GIF processing
   use-pool: true
 
-  # Maximum pool size
+  # Maximum number of reusable 16KB buffers to keep in the pool
   pool-size: 100
 
-  # Maximum memory usage for MB (soft limit for adaptive scaling)
+  # Soft memory ceiling in MB for adaptive performance scaling
+  # When usage approaches this limit, FPS and render distance are reduced
   max-usage-mb: 256
 
+# ─────────────────────────────────────────────────
+#  Quality & Limits
+# ─────────────────────────────────────────────────
+
 quality:
-  # Maximum frames to load from a GIF
+  # Maximum frames to extract from a GIF
+  # Higher = smoother animations but more memory and disk usage
   max-gif-frames: 200
 
-  # Maximum grid size (e.g., 15 = 15x15 max)
+  # Maximum grid dimension (e.g., 15 = up to 15x15 item frame grid)
   max-grid-size: 15
 
+  # Maximum GIF grid size
+  max-gif-grid-size: 4
+
+  # Maximum static image grid size
+  max-image-grid-size: 10
+
+# ─────────────────────────────────────────────────
+#  Downloads
+# ─────────────────────────────────────────────────
+
+downloads:
+  # Maximum file size allowed for image/GIF downloads (in MB)
+  max-file-size-mb: 50
+
+  # Connection timeout in seconds
+  connect-timeout: 10
+
+  # Read timeout in seconds
+  read-timeout: 30
+
+  # Maximum number of HTTP redirects to follow (default recommended)
+  max-redirects: 1
+
+  # Block downloads from local/internal network addresses (default recommended)
+  block-internal-urls: true
+
+# ─────────────────────────────────────────────────
+#  GIF Cache
+# ─────────────────────────────────────────────────
+cache:
+  # Maximum number of processed GIFs to keep in memory
+  max-entries: 20
+
+  # Maximum total memory for cached GIFs (in MB)
+  max-memory-mb: 100
+
+  # How long a cached GIF stays valid without being accessed (in minutes)
+  expire-minutes: 30
+
+# ─────────────────────────────────────────────────
+#  Rate Limiting
+# ─────────────────────────────────────────────────
+rate-limits:
+  # Cooldown between image/GIF processing commands per player (in seconds)
+  cooldown-seconds: 5
+
+  # Maximum number of images/GIFs being processed server-wide at once
+  max-concurrent-tasks: 3
+
+# ─────────────────────────────────────────────────
+#  Messages
+#  Supports &#RRGGBB hex colors and '&' color codes
+# ─────────────────────────────────────────────────
+
 messages:
-  # Processing
-  detected: "&6Detected grid: <width>x<height> &7(facing <facing>, quality: <quality>)"
-  processing-gif: "&6Processing GIF for <width>x<height> grid... Please wait."
+  prefix: "&#4CABBB&lE&#3DA3B8&lm&#2E9BB4&la&#1E92B1&lg&#0F8AAD&le &8&l• "
 
-  # Success
-  success: "&aSuccessfully applied image to &b<total>&a frame(s)!"
-  success-gif: "&aApplied GIF to <total> frame(s) &7(<frames> frames in <time>ms)"
+  # ── General ──
 
-  # Admin
-  migrate-start: "&7Starting migration..."
-  migrated: "&aMigrated &b<count>&a file(s) to optimized format."
-  reloaded: "&aConfiguration reloaded!"
-  cleanup-start: "&7Scanning for unused files..."
-  cleanup-scanning: "&7Found &b<count> &7maps in use, checking files..."
-  cleanup-done: "&aDeleted &b<count> &aunused file(s)"
-  stats: "&7Stats: &b<static> &7static, &b<anim> &7animations, &b<size> &7total, &b<active> &7active"
+  usage: "&#C75050Usage: &#8B9DA0/emage <url> [size] [--quality]"
+  no-frame: "&#C75050Please look at an Item Frame!"
+  invalid-size: "&#C75050Invalid size! Use format: &#4CABBB3x3 &#C75050or just &#4CABBB3"
+  invalid-url: "&#C75050Please provide a valid URL"
+  no-perm: "&#C75050You don't have permission to do that!"
+  error: "&#C75050Failed to load image: &#8B9DA0<error>"
+  players-only: "&#C75050This command can only be used by players!"
+
+  # ── Cooldown ──
+
+  cooldown: "&#C75050Please wait &#E8A84C<remaining>s &#C75050before processing another image."
+
+  # ── Processing ──
+
+  detected: "&#5BBFC9Detected grid: &#4CABBB<width>x<height> &#8B9DA0(facing &#4CABBB<facing>&#8B9DA0, quality: &#4CABBB<quality>&#8B9DA0)"
+  processing-gif: "&#5BBFC9Processing GIF for &#4CABBB<width>x<height> &#5BBFC9grid... Please wait."
+  color-init: "&#C75050Color system is still initializing. Please try again in a few seconds."
+  server-busy: "&#C75050Server is busy processing other images. Please try again shortly."
+  gif-too-large: "&#C75050GIF grid too large! Maximum is &#4CABBB<max>x<max>&#C75050."
+  image-too-large: "&#C75050Image grid too large! Maximum is &#4CABBB<max>x<max>&#C75050."
+  gif-large-warning: "&#E8A84CWarning: &#8B9DA0Large GIF grid (&#E8A84C<width>x<height>&#8B9DA0) may cause lag. Processing..."
+
+  # ── Success ──
+
+  success: "&#50C78ASuccessfully applied image to &#4CABBB<total> &#50C78Aframe(s)!"
+  success-gif: "&#50C78AApplied GIF to &#4CABBB<total> &#50C78Aframe(s) &#8B9DA0(&#4CABBB<frames> &#8B9DA0frames in &#4CABBB<time>&#8B9DA0ms)"
+  success-gif-cached: "&#50C78AApplied &#4CABBB<total> &#50C78Amaps with &#4CABBB<frames> &#50C78Aframes. &#8B9DA0(from cache)"
+  using-cache: "&#50C78AUsing cached GIF data! &#8B9DA0(Use &#4CABBB--nocache &#8B9DA0to reprocess)"
+
+  # ── Admin ──
+
+  reloaded: "&#50C78AConfiguration reloaded!"
+  cleanup-start: "&#8B9DA0Scanning for unused files..."
+  cleanup-scanning: "&#8B9DA0Found &#4CABBB<count> &#8B9DA0maps in use, checking files..."
+  cleanup-done: "&#50C78ADeleted &#4CABBB<count> &#50C78Aunused file(s)."
+  cleanup-none: "&#8B9DA0No unused files found. All &#4CABBB<count> &#8B9DA0files are in use."
+  stats: "&#8B9DA0Stats: &#4CABBB<static> &#8B9DA0static, &#4CABBB<anim> &#8B9DA0animations, &#4CABBB<size> &#8B9DA0total, &#4CABBB<active> &#8B9DA0active"
+  cache-cleared: "&#50C78ACleared &#4CABBB<count> &#50C78Acached GIFs."
+
+  # ── Cache Info ──
+
+  cache-header: "&#5BBFC9GIF Cache:"
+  cache-count: "&#2E4A50 • &#8B9DA0Cached GIFs: &#4CABBB<count>"
+  cache-memory: "&#2E4A50 • &#8B9DA0Memory: &#4CABBB<size>"
+  cache-hitrate: "&#2E4A50 • &#8B9DA0Hit rate: &#4CABBB<rate>"
+
+  # ── Performance Info ──
+
+  perf-header: "&#5BBFC9Performance Status:"
+  perf-status: "&#2E4A50 • &#8B9DA0<status>"
+  perf-animations: "&#2E4A50 • &#8B9DA0Active animations: &#4CABBB<count>"
+  perf-cache: "&#2E4A50 • &#8B9DA0GIF cache: &#4CABBB<count> &#8B9DA0(&#4CABBB<size>&#8B9DA0)"
+  perf-hitrate: "&#2E4A50 • &#8B9DA0Cache hit rate: &#4CABBB<rate>"
+  perf-distance: "&#2E4A50 • &#8B9DA0Render distance: &#4CABBB<distance> blocks"
+
+  # ── Help ──
+
+  help-header: "&#8B9DA0&m----------&r &#4CABBBE&#3DA3B8m&#2E9BB4a&#1E92B1g&#0F8AADe &#5BBFC9Help &#8B9DA0&m----------"
+  help-url: "&#3DA3B8/emage <url> [size] &#8B9DA0- &fApply image to item frames"
+  help-limits: "&#8B9DA0  Limits: GIF &#4CABBB<gif-max>x<gif-max>&#8B9DA0, Image &#4CABBB<image-max>x<image-max>"
+  help-quality: "&#8B9DA0  Quality: &#4CABBB--fast&#8B9DA0, &#4CABBB--balanced&#8B9DA0, &#4CABBB--high"
+  help-aliases: "&#8B9DA0  Flags: &#4CABBB-f&#8B9DA0, &#4CABBB-b&#8B9DA0, &#4CABBB-h&#8B9DA0, &#4CABBB--nocache"
+  help-clearcache: "&#3DA3B8/emage clearcache &#8B9DA0- &fClear GIF processing cache"
+  help-cache: "&#3DA3B8/emage cache &#8B9DA0- &fView cache statistics"
+  help-cleanup: "&#3DA3B8/emage cleanup &#8B9DA0- &fDelete unused map files"
+  help-stats: "&#3DA3B8/emage stats &#8B9DA0- &fShow storage statistics"
+  help-perf: "&#3DA3B8/emage perf &#8B9DA0- &fShow performance status"
+  help-reload: "&#3DA3B8/emage reload &#8B9DA0- &fReload configuration"
+  help-update: "&#3DA3B8/emage update &#8B9DA0- &fCheck for updates"
+  help-footer: "&#8B9DA0&m---------------------------------"
+
+  # ── Updates ──
+
+  update-checking: "&#8B9DA0Checking for updates..."
+  update-latest: "&#50C78AYou are running the latest version! &#8B9DA0(v&#4CABBB<version>&#8B9DA0)"
+  update-disabled: "&#C75050Update checking is disabled in config."
+  update-available: "&#50C78AA new update is available! &#8B9DA0(v&#4CABBB<version>&#8B9DA0)"

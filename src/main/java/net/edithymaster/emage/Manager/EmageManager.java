@@ -1,6 +1,7 @@
-package org.flowerion.emage.Manager;
+package net.edithymaster.emage.Manager;
 
 import org.bukkit.Bukkit;
+import org.bukkit.World;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
@@ -8,10 +9,10 @@ import org.bukkit.event.server.MapInitializeEvent;
 import org.bukkit.event.world.WorldLoadEvent;
 import org.bukkit.map.MapView;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.flowerion.emage.Config.EmageConfig;
-import org.flowerion.emage.Processing.EmageCompression;
-import org.flowerion.emage.Render.EmageRenderer;
-import org.flowerion.emage.Render.GifRenderer;
+import net.edithymaster.emage.Config.EmageConfig;
+import net.edithymaster.emage.Processing.EmageCompression;
+import net.edithymaster.emage.Render.EmageRenderer;
+import net.edithymaster.emage.Render.GifRenderer;
 
 import java.io.*;
 import java.nio.file.Files;
@@ -27,6 +28,7 @@ public final class EmageManager implements Listener {
 
     private final Set<Integer> managedMaps = ConcurrentHashMap.newKeySet();
     private final Map<Integer, CachedMapData> mapCache = new ConcurrentHashMap<>();
+    private final Set<Integer> appliedMaps = ConcurrentHashMap.newKeySet();
 
     private final Map<Long, PendingStaticGrid> pendingStaticGrids = new ConcurrentHashMap<>();
     private final Map<Long, PendingAnimGrid> pendingAnimGrids = new ConcurrentHashMap<>();
@@ -67,9 +69,12 @@ public final class EmageManager implements Listener {
         ioExecutor.shutdown();
         scheduler.shutdown();
         try {
-            ioExecutor.awaitTermination(10, TimeUnit.SECONDS);
+            if (!ioExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+                ioExecutor.shutdownNow();
+            }
         } catch (InterruptedException e) {
             ioExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -78,9 +83,11 @@ public final class EmageManager implements Listener {
     }
 
     public void saveMap(int mapId, byte[] data, long gridId) {
-        managedMaps.add(mapId);
+        boolean isNew = managedMaps.add(mapId);
         mapCache.put(mapId, new CachedMapData(data, null, null, 0, gridId, false));
-        config.incrementMapCount();
+        if (isNew) {
+            config.incrementMapCount();
+        }
 
         PendingStaticGrid grid = pendingStaticGrids.computeIfAbsent(gridId,
                 k -> new PendingStaticGrid(gridId));
@@ -89,11 +96,13 @@ public final class EmageManager implements Listener {
     }
 
     public void saveGif(int mapId, List<byte[]> frames, List<Integer> delays, int avgDelay, long syncId) {
-        managedMaps.add(mapId);
+        boolean isNew = managedMaps.add(mapId);
         mapCache.put(mapId, new CachedMapData(null, new ArrayList<>(frames),
                 new ArrayList<>(delays), avgDelay, syncId, true));
-        config.incrementMapCount();
-        config.incrementAnimationCount();
+        if (isNew) {
+            config.incrementMapCount();
+            config.incrementAnimationCount();
+        }
 
         PendingAnimGrid grid = pendingAnimGrids.computeIfAbsent(syncId,
                 k -> new PendingAnimGrid(syncId, delays));
@@ -126,10 +135,12 @@ public final class EmageManager implements Listener {
             saving = true;
             pendingStaticGrids.remove(gridId);
 
+            final Map<Integer, byte[]> cellsCopy = new HashMap<>(cells);
+
             ioExecutor.submit(() -> {
                 try {
-                    if (cells.size() == 1) {
-                        Map.Entry<Integer, byte[]> entry = cells.entrySet().iterator().next();
+                    if (cellsCopy.size() == 1) {
+                        Map.Entry<Integer, byte[]> entry = cellsCopy.entrySet().iterator().next();
                         int mapId = entry.getKey();
                         byte[] data = entry.getValue();
 
@@ -140,12 +151,12 @@ public final class EmageManager implements Listener {
                         plugin.getLogger().info("Saved static map " + mapId + ": " +
                                 data.length + " -> " + compressed.length + " bytes");
                     } else {
-                        byte[] compressed = EmageCompression.compressStaticGrid(cells, gridId);
+                        byte[] compressed = EmageCompression.compressStaticGrid(cellsCopy, gridId);
                         File file = new File(mapsFolder, "static_" + gridId + ".esgrid");
                         Files.write(file.toPath(), compressed);
 
-                        int rawSize = cells.size() * 16384;
-                        plugin.getLogger().info("Saved static grid: " + cells.size() + " cells, " +
+                        int rawSize = cellsCopy.size() * 16384;
+                        plugin.getLogger().info("Saved static grid: " + cellsCopy.size() + " cells, " +
                                 formatSize(rawSize) + " -> " + formatSize(compressed.length));
                     }
                 } catch (Exception e) {
@@ -182,28 +193,19 @@ public final class EmageManager implements Listener {
             saving = true;
             pendingAnimGrids.remove(syncId);
 
-            final Map<Integer, List<byte[]>> cellsCopy = new HashMap<>();
-            for (Map.Entry<Integer, List<byte[]>> entry : cells.entrySet()) {
-                List<byte[]> framesCopy = new ArrayList<>(entry.getValue().size());
-                for (byte[] frame : entry.getValue()) {
-                    byte[] copy = new byte[frame.length];
-                    System.arraycopy(frame, 0, copy, 0, frame.length);
-                    framesCopy.add(copy);
-                }
-                cellsCopy.put(entry.getKey(), framesCopy);
-            }
+            final Map<Integer, List<byte[]>> cellsCopy = new HashMap<>(cells);
             final List<Integer> delaysCopy = new ArrayList<>(delays);
 
             ioExecutor.submit(() -> {
                 try {
                     byte[] compressed = EmageCompression.compressAnimGrid(cellsCopy, delaysCopy, syncId);
                     File file = new File(mapsFolder, "anim_" + syncId + ".eagrid");
-                    java.nio.file.Files.write(file.toPath(), compressed);
+                    Files.write(file.toPath(), compressed);
 
                     int frameCount = cellsCopy.isEmpty() ? 0 : cellsCopy.values().iterator().next().size();
                     plugin.getLogger().info("Saved animation: " + cellsCopy.size() + " cells, " + frameCount + " frames");
                 } catch (Exception e) {
-                    plugin.getLogger().log(java.util.logging.Level.WARNING, "Failed to save animation " + syncId, e);
+                    plugin.getLogger().log(Level.WARNING, "Failed to save animation " + syncId, e);
                 }
             });
         }
@@ -257,7 +259,10 @@ public final class EmageManager implements Listener {
                             staticLoaded++;
                         }
                     }
-                } catch (Exception ignored) {}
+                } catch (NumberFormatException ignored) {
+                } catch (Exception e) {
+                    plugin.getLogger().warning("Failed to load emap: " + file.getName());
+                }
             }
         }
 
@@ -313,6 +318,7 @@ public final class EmageManager implements Listener {
             MapView mapView = Bukkit.getMap(mapId);
             if (mapView != null) {
                 applyAnimRenderer(mapView, frames, grid.delays, grid.syncId);
+                appliedMaps.add(mapId);
                 count++;
             }
         }
@@ -328,6 +334,7 @@ public final class EmageManager implements Listener {
         MapView mapView = Bukkit.getMap(mapId);
         if (mapView != null) {
             applyStaticRenderer(mapView, data);
+            appliedMaps.add(mapId);
             return true;
         }
         return false;
@@ -355,8 +362,11 @@ public final class EmageManager implements Listener {
         @SuppressWarnings("deprecation")
         int mapId = event.getMap().getId();
 
+        if (appliedMaps.contains(mapId)) return;
+
         CachedMapData cached = mapCache.get(mapId);
         if (cached != null) {
+            appliedMaps.add(mapId);
             Bukkit.getScheduler().runTaskLater(plugin, () -> {
                 if (cached.isAnimation) {
                     applyAnimRenderer(event.getMap(), cached.frames, cached.delays, cached.syncId);
@@ -368,18 +378,33 @@ public final class EmageManager implements Listener {
     }
 
     @EventHandler
+    public void onWorldSave(org.bukkit.event.world.WorldSaveEvent event) {
+        for (PendingStaticGrid grid : pendingStaticGrids.values()) {
+            grid.saveNow();
+        }
+        for (PendingAnimGrid grid : pendingAnimGrids.values()) {
+            grid.saveNow();
+        }
+    }
+
+    @EventHandler
     public void onWorldLoad(WorldLoadEvent event) {
+        World loadedWorld = event.getWorld();
         Bukkit.getScheduler().runTaskLater(plugin, () -> {
             for (Map.Entry<Integer, CachedMapData> entry : mapCache.entrySet()) {
+                int mapId = entry.getKey();
+                if (appliedMaps.contains(mapId)) continue;
+
                 @SuppressWarnings("deprecation")
-                MapView mapView = Bukkit.getMap(entry.getKey());
-                if (mapView != null) {
+                MapView mapView = Bukkit.getMap(mapId);
+                if (mapView != null && loadedWorld.equals(mapView.getWorld())) {
                     CachedMapData cached = entry.getValue();
                     if (cached.isAnimation) {
                         applyAnimRenderer(mapView, cached.frames, cached.delays, cached.syncId);
                     } else if (cached.staticData != null) {
                         applyStaticRenderer(mapView, cached.staticData);
                     }
+                    appliedMaps.add(mapId);
                 }
             }
         }, 40L);
@@ -429,6 +454,7 @@ public final class EmageManager implements Listener {
                         for (int mapId : fileMapIds) {
                             managedMaps.remove(mapId);
                             mapCache.remove(mapId);
+                            appliedMaps.remove(mapId);
                         }
                     } else {
                         plugin.getLogger().warning("Cleanup: Failed to delete " + name);
@@ -478,7 +504,7 @@ public final class EmageManager implements Listener {
                 mapIds.add(dis.readInt());
             }
 
-        } catch (Exception e) {
+        } catch (IOException e) {
             plugin.getLogger().fine("Could not read map IDs from " + file.getName() + ": " + e.getMessage());
         }
 
@@ -491,28 +517,21 @@ public final class EmageManager implements Listener {
         try (DataInputStream dis = new DataInputStream(new FileInputStream(file))) {
             int m1 = dis.readByte() & 0xFF;
             int m2 = dis.readByte() & 0xFF;
-            int version = dis.readByte() & 0xFF;
 
             if (m1 != 'E' || m2 != 'G') {
                 return mapIds;
             }
 
+            dis.readByte();
             dis.readLong();
-
-            int cellCount = dis.readInt();
-
+            dis.readInt();
             dis.readInt();
 
-            for (int i = 0; i < cellCount; i++) {
-                dis.readShort();
-            }
-
-        } catch (Exception e) {
+        } catch (IOException e) {
             plugin.getLogger().fine("Could not read map IDs from legacy " + file.getName());
         }
 
         try {
-            byte[] data = java.nio.file.Files.readAllBytes(file.toPath());
             Set<Integer> ids = EmageCompression.getMapIdsFromFile(file);
             if (!ids.isEmpty()) {
                 return ids;

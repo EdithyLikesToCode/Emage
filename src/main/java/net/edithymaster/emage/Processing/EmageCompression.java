@@ -1,13 +1,17 @@
-package org.flowerion.emage.Processing;
+package net.edithymaster.emage.Processing;
 
 import java.io.*;
 import java.util.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.zip.Deflater;
 import java.util.zip.Inflater;
 
 public final class EmageCompression {
 
     private EmageCompression() {}
+
+    private static final Logger logger = Logger.getLogger(EmageCompression.class.getName());
 
     private static final int MAP_SIZE = 16384;
 
@@ -67,73 +71,12 @@ public final class EmageCompression {
 
             dos.close();
 
-            byte[] result = baos.toByteArray();
+            return baos.toByteArray();
 
-            return result;
-
-        } catch (Exception e) {
-            e.printStackTrace();
+        } catch (IOException e) {
+            logger.log(Level.WARNING, "Failed to compress static map data", e);
             return deflateFallback(data);
         }
-    }
-
-    private static long frameHash(byte[] data) {
-        long hash = 0;
-        int step = Math.max(1, data.length / 64);
-        for (int i = 0; i < data.length; i += step) {
-            hash = hash * 31 + (data[i] & 0xFF);
-        }
-        return hash;
-    }
-
-    private static boolean framesEqual(byte[] a, byte[] b) {
-        if (a.length != b.length) return false;
-
-        int[] checkPoints = {0, 127, 8128, 16256, 16383};
-        for (int i : checkPoints) {
-            if (i < a.length && a[i] != b[i]) return false;
-        }
-
-        for (int i = 0; i < a.length; i++) {
-            if (a[i] != b[i]) return false;
-        }
-        return true;
-    }
-
-    private static int countDifferences(byte[] a, byte[] b, int maxDiff) {
-        int count = 0;
-        for (int i = 0; i < a.length && count <= maxDiff; i++) {
-            if (a[i] != b[i]) count++;
-        }
-        return count;
-    }
-
-    private static byte[] encodeSparse(byte[] current, byte[] reference, int diffCount) {
-        int size = 2 + (diffCount * 3);
-        byte[] result = new byte[size];
-
-        result[0] = (byte) ((diffCount >> 8) & 0xFF);
-        result[1] = (byte) (diffCount & 0xFF);
-
-        int pos = 2;
-        for (int i = 0; i < current.length && pos < size; i++) {
-            if (current[i] != reference[i]) {
-                result[pos++] = (byte) ((i >> 8) & 0xFF);
-                result[pos++] = (byte) (i & 0xFF);
-                result[pos++] = current[i];
-            }
-        }
-
-        return result;
-    }
-
-    public static byte[] compressAnimGridParallel(Map<Integer, List<byte[]>> cells,
-                                                  List<Integer> delays, long syncId) {
-        if (cells.size() <= 4) {
-            return compressAnimGrid(cells, delays, syncId);
-        }
-
-        return compressAnimGrid(cells, delays, syncId);
     }
 
     public static byte[] decompressSingleStatic(byte[] compressed) {
@@ -183,8 +126,8 @@ public final class EmageCompression {
 
             return result;
 
-        } catch (Exception e) {
-            e.printStackTrace();
+        } catch (IOException e) {
+            logger.log(Level.WARNING, "Failed to decompress static map data", e);
             return decompressLegacy(compressed);
         }
     }
@@ -223,12 +166,8 @@ public final class EmageCompression {
                 return mapIds;
             }
 
-            if (header[0] == 'E' && header[1] == 'M') {
-                return mapIds;
-            }
-
-        } catch (Exception e) {
-            // Ignore errors, return empty set
+        } catch (IOException e) {
+            logger.log(Level.FINE, "Could not read map IDs from file " + file.getName(), e);
         }
 
         return mapIds;
@@ -358,17 +297,16 @@ public final class EmageCompression {
             dos.close();
 
             byte[] result = baos.toByteArray();
-
             int rawSize = cells.size() * MAP_SIZE;
 
-            System.out.println("[Emage Debug] Static grid compression: " + rawSize + " -> " + result.length +
+            logger.fine("Static grid compression: " + rawSize + " -> " + result.length +
                     " bytes (" + String.format("%.1f%%", result.length * 100.0 / rawSize) +
                     "), cells: " + cells.size() + ", colors: " + uniqueColors + ", bpp: " + bpp);
 
             return result;
 
-        } catch (Exception e) {
-            e.printStackTrace();
+        } catch (IOException e) {
+            logger.log(Level.WARNING, "Failed to compress static grid", e);
             return new byte[0];
         }
     }
@@ -426,8 +364,7 @@ public final class EmageCompression {
                     remapped = prevRemapped != null ? prevRemapped.clone() : new byte[MAP_SIZE];
                 } else {
                     int dataLen = readShort(cellIn);
-                    byte[] frameData = new byte[dataLen];
-                    cellIn.read(frameData);
+                    byte[] frameData = readExact(cellIn, dataLen);
 
                     if (marker == 0) {
                         remapped = unpackBits(frameData, bpp, MAP_SIZE);
@@ -461,8 +398,8 @@ public final class EmageCompression {
 
             return new StaticGridData(gridId, cells);
 
-        } catch (Exception e) {
-            e.printStackTrace();
+        } catch (IOException e) {
+            logger.log(Level.WARNING, "Failed to decompress static grid", e);
             return null;
         }
     }
@@ -554,8 +491,8 @@ public final class EmageCompression {
 
                     byte[] temporalRef = prevTemporal.get(mapId);
 
-                    byte[] bestData = null;
-                    int bestMarker = 0;
+                    byte[] bestData;
+                    int bestMarker;
 
                     byte[] fullPacked = packBits(remapped, bpp);
                     bestData = fullPacked;
@@ -597,20 +534,18 @@ public final class EmageCompression {
 
             dos.close();
 
-            byte[] result = baos.toByteArray();
+            return baos.toByteArray();
 
-            return result;
-
-        } catch (Exception e) {
-            e.printStackTrace();
+        } catch (IOException e) {
+            logger.log(Level.WARNING, "Failed to compress animation grid", e);
             return new byte[0];
         }
     }
 
     private static class EncodingResult {
-        byte[] data;
-        int marker;
-        int size;
+        final byte[] data;
+        final int marker;
+        final int size;
 
         EncodingResult(byte[] data, int marker) {
             this.data = data;
@@ -640,7 +575,8 @@ public final class EmageCompression {
                     }
                 }
                 return new EncodingResult(sparse.toByteArray(), 1);
-            } catch (Exception e) {
+            } catch (IOException e) {
+                logger.log(Level.FINE, "Sparse encoding failed, falling back to XOR", e);
             }
         }
 
@@ -732,8 +668,7 @@ public final class EmageCompression {
                         remapped = reference != null ? reference.clone() : new byte[MAP_SIZE];
                     } else {
                         int dataLen = readShort(frameIn);
-                        byte[] frameData = new byte[dataLen];
-                        frameIn.read(frameData);
+                        byte[] frameData = readExact(frameIn, dataLen);
 
                         if (marker == 0) {
                             remapped = unpackBits(frameData, bpp, MAP_SIZE);
@@ -769,8 +704,8 @@ public final class EmageCompression {
 
             return new AnimGridData(syncId, cells, delays);
 
-        } catch (Exception e) {
-            e.printStackTrace();
+        } catch (IOException e) {
+            logger.log(Level.WARNING, "Failed to decompress animation grid", e);
             return null;
         }
     }
@@ -783,7 +718,9 @@ public final class EmageCompression {
                 cells.put(0, animData.frames);
                 return new AnimGridData(animData.syncId, cells, animData.delays);
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            logger.log(Level.FINE, "Legacy animation decompression failed", e);
+        }
         return null;
     }
 
@@ -791,6 +728,7 @@ public final class EmageCompression {
         try {
             return EmageCore.decompressMap(data);
         } catch (Exception e) {
+            logger.log(Level.FINE, "Legacy decompression failed", e);
             return new byte[MAP_SIZE];
         }
     }
@@ -810,7 +748,8 @@ public final class EmageCompression {
             dos.close();
 
             return baos.toByteArray();
-        } catch (Exception e) {
+        } catch (IOException e) {
+            logger.log(Level.WARNING, "Deflate fallback failed", e);
             return data;
         }
     }
@@ -857,8 +796,8 @@ public final class EmageCompression {
     }
 
     private static byte[] deflate(byte[] data) {
+        Deflater deflater = new Deflater(Deflater.BEST_COMPRESSION);
         try {
-            Deflater deflater = new Deflater(Deflater.BEST_COMPRESSION);
             deflater.setInput(data);
             deflater.finish();
 
@@ -870,16 +809,15 @@ public final class EmageCompression {
                 baos.write(buffer, 0, count);
             }
 
-            deflater.end();
             return baos.toByteArray();
-        } catch (Exception e) {
-            return data;
+        } finally {
+            deflater.end();
         }
     }
 
     private static byte[] inflate(byte[] data, int expectedSize) {
+        Inflater inflater = new Inflater();
         try {
-            Inflater inflater = new Inflater();
             inflater.setInput(data);
 
             byte[] result = new byte[expectedSize];
@@ -891,11 +829,24 @@ public final class EmageCompression {
                 offset += count;
             }
 
-            inflater.end();
             return result;
         } catch (Exception e) {
+            logger.log(Level.WARNING, "Inflate failed", e);
             return new byte[expectedSize];
+        } finally {
+            inflater.end();
         }
+    }
+
+    private static byte[] readExact(InputStream in, int len) throws IOException {
+        byte[] buf = new byte[len];
+        int offset = 0;
+        while (offset < len) {
+            int read = in.read(buf, offset, len - offset);
+            if (read < 0) throw new IOException("Unexpected end of stream, needed " + len + " bytes, got " + offset);
+            offset += read;
+        }
+        return buf;
     }
 
     private static void writeShort(OutputStream out, int value) throws IOException {
@@ -907,12 +858,6 @@ public final class EmageCompression {
         int b1 = in.read() & 0xFF;
         int b2 = in.read() & 0xFF;
         return (b1 << 8) | b2;
-    }
-
-    private static String formatSize(long bytes) {
-        if (bytes < 1024) return bytes + " B";
-        if (bytes < 1024 * 1024) return String.format("%.1f KB", bytes / 1024.0);
-        return String.format("%.2f MB", bytes / (1024.0 * 1024.0));
     }
 
     public static class StaticGridData {

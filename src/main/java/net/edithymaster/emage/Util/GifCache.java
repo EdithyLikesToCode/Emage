@@ -1,10 +1,14 @@
-package org.flowerion.emage.Util;
+package net.edithymaster.emage.Util;
 
-import org.flowerion.emage.Processing.EmageCore;
+import net.edithymaster.emage.Processing.EmageCore;
 
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 public final class GifCache {
 
@@ -13,22 +17,27 @@ public final class GifCache {
     private static final Map<String, CacheEntry> CACHE = new ConcurrentHashMap<>();
 
     private static final int MAX_ENTRIES = 20;
-    private static final long MAX_MEMORY_BYTES = 100 * 1024 * 1024; // 100MB
-    private static final long EXPIRE_TIME_MS = 30 * 60 * 1000; // 30 minutes
+    private static final long MAX_MEMORY_BYTES = 100L * 1024 * 1024;
+    private static final long EXPIRE_TIME_MS = 30L * 60 * 1000;
 
-    private static long hits = 0;
-    private static long misses = 0;
+    private static final AtomicLong hits = new AtomicLong(0);
+    private static final AtomicLong misses = new AtomicLong(0);
+    private static final AtomicLong totalSizeBytes = new AtomicLong(0);
+
+    private static volatile Logger logger;
+
+    public static void init(Logger log) {
+        logger = log;
+    }
 
     private static class CacheEntry {
         final EmageCore.GifGridData data;
-        final long createdAt;
         final long sizeBytes;
-        long lastAccessed;
+        volatile long lastAccessed;
 
         CacheEntry(EmageCore.GifGridData data) {
             this.data = data;
-            this.createdAt = System.currentTimeMillis();
-            this.lastAccessed = this.createdAt;
+            this.lastAccessed = System.currentTimeMillis();
             this.sizeBytes = calculateSize(data);
         }
 
@@ -57,12 +66,13 @@ public final class GifCache {
         try {
             MessageDigest md = MessageDigest.getInstance("MD5");
             byte[] hash = md.digest(input.getBytes());
-            StringBuilder sb = new StringBuilder();
+            StringBuilder sb = new StringBuilder(32);
             for (byte b : hash) {
                 sb.append(String.format("%02x", b));
             }
             return sb.toString();
-        } catch (Exception e) {
+        } catch (NoSuchAlgorithmException e) {
+            if (logger != null) logger.log(Level.WARNING, "MD5 not available, using hashCode", e);
             return String.valueOf(input.hashCode());
         }
     }
@@ -71,42 +81,54 @@ public final class GifCache {
         CacheEntry entry = CACHE.get(key);
 
         if (entry == null) {
-            misses++;
+            misses.incrementAndGet();
             return null;
         }
 
         if (entry.isExpired()) {
-            CACHE.remove(key);
-            misses++;
+            if (CACHE.remove(key, entry)) {
+                totalSizeBytes.addAndGet(-entry.sizeBytes);
+            }
+            misses.incrementAndGet();
             return null;
         }
 
         entry.lastAccessed = System.currentTimeMillis();
-        hits++;
+        hits.incrementAndGet();
         return entry.data;
     }
 
     public static void put(String key, EmageCore.GifGridData data) {
         cleanupExpired();
 
-        evictIfNeeded();
+        CacheEntry newEntry = new CacheEntry(data);
 
-        CACHE.put(key, new CacheEntry(data));
+        evictIfNeeded(newEntry.sizeBytes);
+
+        CacheEntry old = CACHE.put(key, newEntry);
+        if (old != null) {
+            totalSizeBytes.addAndGet(-old.sizeBytes);
+        }
+        totalSizeBytes.addAndGet(newEntry.sizeBytes);
     }
 
     private static void cleanupExpired() {
-        CACHE.entrySet().removeIf(entry -> entry.getValue().isExpired());
+        CACHE.entrySet().removeIf(entry -> {
+            if (entry.getValue().isExpired()) {
+                totalSizeBytes.addAndGet(-entry.getValue().sizeBytes);
+                return true;
+            }
+            return false;
+        });
     }
 
-    private static void evictIfNeeded() {
+    private static void evictIfNeeded(long incomingSize) {
         while (CACHE.size() >= MAX_ENTRIES) {
             evictOldest();
         }
 
-        long totalSize = CACHE.values().stream().mapToLong(e -> e.sizeBytes).sum();
-        while (totalSize > MAX_MEMORY_BYTES && !CACHE.isEmpty()) {
+        while (totalSizeBytes.get() + incomingSize > MAX_MEMORY_BYTES && !CACHE.isEmpty()) {
             evictOldest();
-            totalSize = CACHE.values().stream().mapToLong(e -> e.sizeBytes).sum();
         }
     }
 
@@ -122,34 +144,33 @@ public final class GifCache {
         }
 
         if (oldestKey != null) {
-            CACHE.remove(oldestKey);
+            CacheEntry removed = CACHE.remove(oldestKey);
+            if (removed != null) {
+                totalSizeBytes.addAndGet(-removed.sizeBytes);
+            }
         }
     }
 
     public static int clearCache() {
         int count = CACHE.size();
         CACHE.clear();
-        hits = 0;
-        misses = 0;
+        hits.set(0);
+        misses.set(0);
+        totalSizeBytes.set(0);
         return count;
     }
 
     public static CacheStats getStats() {
-        long totalSize = CACHE.values().stream().mapToLong(e -> e.sizeBytes).sum();
-        double hitRate = (hits + misses) > 0 ? (double) hits / (hits + misses) : 0;
+        long size = totalSizeBytes.get();
+        long h = hits.get();
+        long m = misses.get();
+        double hitRate = (h + m) > 0 ? (double) h / (h + m) : 0;
 
-        return new CacheStats(
-                CACHE.size(),
-                totalSize,
-                formatSize(totalSize),
-                hits,
-                misses,
-                hitRate
-        );
+        return new CacheStats(CACHE.size(), size, formatSize(size), h, m, hitRate);
     }
 
     private static String formatSize(long bytes) {
-        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024) return bytes + "B";
         if (bytes < 1024 * 1024) return String.format("%.1f KB", bytes / 1024.0);
         return String.format("%.1f MB", bytes / (1024.0 * 1024.0));
     }

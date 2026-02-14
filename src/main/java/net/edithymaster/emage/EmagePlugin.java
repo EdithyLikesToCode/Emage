@@ -1,15 +1,15 @@
-package org.flowerion.emage;
+package net.edithymaster.emage;
 
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.flowerion.emage.Command.EmageCommand;
-import org.flowerion.emage.Config.EmageConfig;
-import org.flowerion.emage.Manager.EmageManager;
-import org.flowerion.emage.Processing.EmageCore;
-import org.flowerion.emage.Render.GifRenderer;
-import org.flowerion.emage.Util.GifCache;
-import org.flowerion.emage.Util.UpdateChecker;
+import net.edithymaster.emage.Command.EmageCommand;
+import net.edithymaster.emage.Config.EmageConfig;
+import net.edithymaster.emage.Manager.EmageManager;
+import net.edithymaster.emage.Processing.EmageCore;
+import net.edithymaster.emage.Render.GifRenderer;
+import net.edithymaster.emage.Util.GifCache;
+import net.edithymaster.emage.Util.UpdateChecker;
 
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -21,11 +21,10 @@ public final class EmagePlugin extends JavaPlugin {
     private EmageConfig emageConfig;
     private final Pattern hexPattern = Pattern.compile("&#([a-fA-F0-9]{6})");
 
-    private static final String PREFIX = "&#321212&lE&#3E1111&lm&#4A0F0F&la&#560E0E&lg&#620C0C&le &8&l• ";
-
     @Override
     public void onEnable() {
         saveDefaultConfig();
+        backfillConfig();
 
         getLogger().info("Initializing color system...");
         Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
@@ -35,6 +34,7 @@ public final class EmagePlugin extends JavaPlugin {
 
         emageConfig = new EmageConfig(this);
 
+        GifCache.init(getLogger());
         GifRenderer.init(this, emageConfig);
 
         manager = new EmageManager(this, emageConfig);
@@ -56,6 +56,26 @@ public final class EmagePlugin extends JavaPlugin {
         getLogger().info("Emage v" + getDescription().getVersion() + " enabled!");
     }
 
+    private void backfillConfig() {
+        boolean changed = false;
+        var config = getConfig();
+        var defaults = config.getDefaults();
+
+        if (defaults != null) {
+            for (String key : defaults.getKeys(true)) {
+                if (!config.isSet(key)) {
+                    config.set(key, defaults.get(key));
+                    changed = true;
+                }
+            }
+        }
+
+        if (changed) {
+            saveConfig();
+            getLogger().info("Added missing config entries from defaults.");
+        }
+    }
+
     @Override
     public void onDisable() {
         GifRenderer.stop();
@@ -74,23 +94,27 @@ public final class EmagePlugin extends JavaPlugin {
         getLogger().info("Emage disabled!");
     }
 
+    public String getPrefix() {
+        String prefix = getConfig().getString("messages.prefix");
+        if (prefix == null) {
+            prefix = "&#321212&lE&#3E1111&lm&#4A0F0F&la&#560E0E&lg&#620C0C&le &8&l• ";
+        }
+        return colorize(prefix);
+    }
+
+    private String getRawPrefix() {
+        String prefix = getConfig().getString("messages.prefix");
+        if (prefix == null) {
+            prefix = "&#321212&lE&#3E1111&lm&#4A0F0F&la&#560E0E&lg&#620C0C&le &8&l• ";
+        }
+        return prefix;
+    }
+
     public String msg(String key, String... placeholders) {
         String message = getConfig().getString("messages." + key);
-        if (message == null) return ChatColor.RED + "Missing: " + key;
+        if (message == null) return ChatColor.RED + "Missing message: " + key;
 
-        message = PREFIX + message;
-
-        for (int i = 0; i + 1 < placeholders.length; i += 2) {
-            String value = placeholders[i + 1] != null ? placeholders[i + 1] : "";
-            message = message.replace(placeholders[i], value);
-        }
-
-        return colorize(message);
-    }
-
-    public String hardcodedMsg(String key, String... placeholders) {
-        String message = getHardcodedMessage(key);
-        if (message == null) return ChatColor.RED + "Missing: " + key;
+        message = getRawPrefix() + message;
 
         for (int i = 0; i + 1 < placeholders.length; i += 2) {
             String value = placeholders[i + 1] != null ? placeholders[i + 1] : "";
@@ -100,38 +124,16 @@ public final class EmagePlugin extends JavaPlugin {
         return colorize(message);
     }
 
-    public String getPrefix() {
-        return colorize(PREFIX);
-    }
+    public String msgNoPrefix(String key, String... placeholders) {
+        String message = getConfig().getString("messages." + key);
+        if (message == null) return ChatColor.RED + "Missing message: " + key;
 
-    private String getHardcodedMessage(String key) {
-        return switch (key) {
-            case "usage" -> PREFIX + "&cUsage: /emage <url> [size] [--quality]";
-            case "no-frame" -> PREFIX + "&cPlease look at an Item Frame!";
-            case "invalid-size" -> PREFIX + "&cInvalid size! Use format: 3x3 or just 3";
-            case "invalid-url" -> PREFIX + "&cPlease provide a valid URL";
-            case "no-perm" -> PREFIX + "&cYou don't have permission to do that!";
-            case "error" -> PREFIX + "&cFailed to load image: &7<error>";
+        for (int i = 0; i + 1 < placeholders.length; i += 2) {
+            String value = placeholders[i + 1] != null ? placeholders[i + 1] : "";
+            message = message.replace(placeholders[i], value);
+        }
 
-            case "help-header" -> "&7&m----------&r &6Emage Help &7&m----------";
-            case "help-url" -> "&6/emage <url> [size] &7- &fApply image to item frames";
-            case "help-quality" -> "&7  Quality: &e--fast&7, &e--balanced&7, &e--high";
-            case "help-aliases" -> "&7  Flags: &e-f&7, &e-b&7, &e-h&7, &e--nocache";
-            case "help-migrate" -> "&6/emage migrate &7- &fConvert old format files";
-            case "help-reload" -> "&6/emage reload &7- &fReload configuration";
-            case "help-cleanup" -> "&6/emage cleanup &7- &fDelete unused map files";
-            case "help-stats" -> "&6/emage stats &7- &fShow storage statistics";
-            case "help-update" -> "&6/emage update &7- &fCheck for updates";
-            case "help-perf" -> "&6/emage perf &7- &fShow performance status";
-            case "help-footer" -> "&7&m---------------------------------";
-
-            case "update-checking" -> PREFIX + "&7Checking for updates...";
-            case "update-latest" -> PREFIX + "&aYou are running the latest version! &7(v<version>)";
-            case "update-disabled" -> PREFIX + "&cUpdate checking is disabled in config.";
-            case "update-available" -> PREFIX + "&aA new update is available! &7(v<version>)";
-
-            default -> null;
-        };
+        return colorize(message);
     }
 
     public String colorize(String message) {
