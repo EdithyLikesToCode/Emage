@@ -4,7 +4,7 @@ A Minecraft plugin for displaying images and animated GIFs on item frames. Suppo
 
 [![Modrinth](https://img.shields.io/modrinth/dt/emage?logo=modrinth&label=Modrinth&color=00AF5C)](https://modrinth.com/plugin/emage)
 [![SpigotMC](https://img.shields.io/badge/SpigotMC-Download-orange)](https://www.spigotmc.org/resources/emage.130410/)
-[![GitHub](https://img.shields.io/github/v/release/EdithyLikesToCode/Emage?logo=github&label=GitHub)](https://github.com/EdithyLikesToCode/Emage)
+[![GitHub](https://img.shields.io/github/v/release/EdithyLikesToCode/Emage?logo=github&label=GitHub)](https://github.com/Ed1thy/Emage)
 
 > ⚠️ **Remember, this is Minecraft.** The color palette is limited to the map color table, and GIF playback is bound by server tick rate and packet throughput. The color accuracy and animation performance doesn't get much better than this. it's about as good as it gets within Minecraft's constraints.
 
