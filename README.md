@@ -27,7 +27,7 @@ A Minecraft plugin for displaying images and animated GIFs on item frames. Suppo
 
 ## Screenshots
 
-| Single frame | Multi-frame grid |
+| 3x3 | 9x9 |
 |:---:|:---:|
 | ![Static](https://cdn.imgchest.com/files/1047bf5e0c63.png) | ![Grid](https://cdn.imgchest.com/files/554f1415a4fd.png) |
 
@@ -76,9 +76,3 @@ Place item frames on a wall (or floor/ceiling) in a grid, look at one of them, a
 ```
 
 If you don't specify a size, the plugin uses whatever grid it detects. If you do specify a size, it anchors from the frame you're looking at.
-
-## Links
-
-- [GitHub](https://github.com/Ed1thy/Emage)
-- [Modrinth](https://modrinth.com/plugin/emage)
-- [SpigotMC](https://www.spigotmc.org/resources/emage.130410/)
