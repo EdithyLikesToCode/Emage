@@ -37,6 +37,7 @@ public final class GifRenderer extends MapRenderer {
     private volatile MapView mapView;
     private volatile int lastRenderedFrame = -1;
     private volatile boolean needsRender = true;
+    private static long lastTickTime = 0;
 
     private static class SyncGroup {
         final long syncID;
@@ -135,7 +136,7 @@ public final class GifRenderer extends MapRenderer {
         if (running) return;
         running = true;
 
-        Bukkit.getScheduler().runTaskTimer(plugin, GifRenderer::tick, 1L, 1L);
+        Bukkit.getScheduler().runTaskTimer(plugin, GifRenderer::tick, 1L, 2L);
     }
 
     public static void stop() {
@@ -145,11 +146,32 @@ public final class GifRenderer extends MapRenderer {
         MAP_LOCATIONS.clear();
     }
 
+    private static long lastTickTIme = 0;
+    private static int tickCounter = 0;
+
     private static void tick() {
         if (!running || SYNC_GROUPS.isEmpty()) return;
         if (Bukkit.getOnlinePlayers().isEmpty()) return;
 
         long now = System.currentTimeMillis();
+
+        int fps = config != null ? config.getAnimationFps() : 30;
+        long minFrameInterval = 1000L / Math.max(1, fps);
+
+        if (now - lastTickTime < minFrameInterval) {
+            return;
+        }
+        lastTickTime = now;
+
+        int updateInterval = config != null ? config.getMapUpdateInterval() : 1;
+        tickCounter++;
+        if (tickCounter < updateInterval) {
+            for (SyncGroup group : SYNC_GROUPS.values()) {
+                group.tick(now);
+            }
+            return;
+        }
+        tickCounter = 0;
 
         boolean anyChanged = false;
         for (SyncGroup group : SYNC_GROUPS.values()) {
@@ -161,6 +183,20 @@ public final class GifRenderer extends MapRenderer {
         if (anyChanged) {
             sendMapUpdates();
         }
+    }
+
+    public static void removeByMapId(int mapId) {
+        GifRenderer renderer = RENDERERS.remove(mapId);
+        if (renderer != null) {
+            SyncGroup group = SYNC_GROUPS.get(renderer.syncId);
+            if (group != null) {
+                group.renderers.remove(renderer);
+                if (group.renderers.isEmpty()) {
+                    SYNC_GROUPS.remove(renderer.syncId);
+                }
+            }
+        }
+        MAP_LOCATIONS.remove(mapId);
     }
 
     private static void sendMapUpdates() {
@@ -177,10 +213,14 @@ public final class GifRenderer extends MapRenderer {
         if (dirtyRenderers.isEmpty()) return;
 
         int renderDistSq = config != null ? config.getRenderDistanceSquared() : DEFAULT_RENDER_DISTANCE_SQ;
-        int perPlayerBudget = config != null ? config.getMaxPacketsPerTick() : 80;
+        int perPlayerBudget = config != null ? config.getMaxPacketsPerTick() : 32;
+
+        int globalBudget = perPlayerBudget * 2;
+        int globalSent = 0;
 
         for (Player player : players) {
             if (!player.isOnline()) continue;
+            if (globalSent >= globalBudget) break;
 
             Location playerLoc = player.getLocation();
             World playerWorld = player.getWorld();
@@ -188,6 +228,7 @@ public final class GifRenderer extends MapRenderer {
 
             for (int i = 0, size = dirtyRenderers.size(); i < size; i++) {
                 if (sent >= perPlayerBudget) break;
+                if (globalSent >= globalBudget) break;
 
                 GifRenderer renderer = dirtyRenderers.get(i);
 
@@ -196,13 +237,20 @@ public final class GifRenderer extends MapRenderer {
                 Location mapLoc = MAP_LOCATIONS.get(mapID);
 
                 if (mapLoc != null) {
-                    if (!playerWorld.equals(mapLoc.getWorld())) continue;
-                    if (playerLoc.distanceSquared(mapLoc) > renderDistSq) continue;
+                    World mapWorld = mapLoc.getWorld();
+                    if (mapWorld == null || !playerWorld.equals(mapWorld)) continue;
+
+                    double dx = playerLoc.getX() - mapLoc.getX();
+                    double dy = playerLoc.getY() - mapLoc.getY();
+                    double dz = playerLoc.getZ() - mapLoc.getZ();
+                    double distSq = dx * dx + dy * dy + dz * dz;
+                    if (distSq > renderDistSq) continue;
                 }
 
                 try {
                     player.sendMap(renderer.mapView);
                     sent++;
+                    globalSent++;
                 } catch (Exception ignored) {}
             }
         }
@@ -290,7 +338,7 @@ public final class GifRenderer extends MapRenderer {
             frameIndex = 0;
         }
 
-        if (frameIndex == lastRenderedFrame && !needsRender) {
+        if (frameIndex == lastRenderedFrame) {
             return;
         }
 

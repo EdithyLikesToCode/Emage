@@ -98,6 +98,12 @@ public final class EmageCommand implements CommandExecutor, TabCompleter {
                 }
                 plugin.reloadConfig();
                 plugin.getEmageConfig().reload();
+                EmageCore.setConfig(plugin.getEmageConfig());
+                GifCache.configure(
+                        plugin.getEmageConfig().getCacheMaxEntries(),
+                        plugin.getEmageConfig().getCacheMaxMemoryBytes(),
+                        plugin.getEmageConfig().getCacheExpireMs()
+                );
                 pl.sendMessage(plugin.msg("reloaded"));
                 return true;
             }
@@ -249,7 +255,13 @@ public final class EmageCommand implements CommandExecutor, TabCompleter {
         }
 
         try {
-            new URI(urlStr).toURL();
+            URI uri = new URI(urlStr);
+            String scheme = uri.getScheme();
+            if (scheme == null || (!scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https"))) {
+                pl.sendMessage(plugin.msg("invalid-url"));
+                return true;
+            }
+            uri.toURL();
         } catch (Exception e) {
             pl.sendMessage(plugin.msg("invalid-url"));
             return true;
@@ -430,10 +442,7 @@ public final class EmageCommand implements CommandExecutor, TabCompleter {
 
     private void processStaticImage(Player player, URL url, List<FrameNode> nodes,
                                     int gridWidth, int gridHeight, EmageCore.Quality quality) throws Exception {
-        BufferedImage original = ImageIO.read(url);
-        if (original == null) {
-            throw new Exception("Failed to read image");
-        }
+        BufferedImage original = EmageCore.downloadImage(url);
 
         int totalWidth = gridWidth * 128;
         int totalHeight = gridHeight * 128;
@@ -467,6 +476,29 @@ public final class EmageCommand implements CommandExecutor, TabCompleter {
             }
             player.sendMessage(plugin.msg("success", "<total>", String.valueOf(applied)));
         });
+    }
+
+    @SuppressWarnings("deprecation")
+    private MapView getOrCreateMapView(ItemFrame frame) {
+        ItemStack existing = frame.getItem();
+        if (existing != null && existing.getType() == Material.FILLED_MAP) {
+            try {
+                MapMeta meta = (MapMeta) existing.getItemMeta();
+                if (meta != null && meta.hasMapView()) {
+                    MapView view = meta.getMapView();
+                    if (view != null) {
+                        for (org.bukkit.map.MapRenderer r : view.getRenderers()) {
+                            if (r instanceof GifRenderer gifRenderer) {
+                                gifRenderer.remove();
+                            }
+                            view.removeRenderer(r);
+                        }
+                        return view;
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+        return Bukkit.createMap(frame.getWorld());
     }
 
     private void processGif(Player player, URL url, List<FrameNode> nodes,
@@ -549,7 +581,7 @@ public final class EmageCommand implements CommandExecutor, TabCompleter {
 
     @SuppressWarnings("deprecation")
     private void applyMapToFrame(ItemFrame frame, byte[] mapData, long gridId) {
-        MapView mapView = Bukkit.createMap(frame.getWorld());
+        MapView mapView = getOrCreateMapView(frame);
         mapView.getRenderers().forEach(mapView::removeRenderer);
         mapView.setTrackingPosition(false);
         mapView.setUnlimitedTracking(false);
@@ -571,7 +603,7 @@ public final class EmageCommand implements CommandExecutor, TabCompleter {
     @SuppressWarnings("deprecation")
     private void applyGifToFrame(ItemFrame frame, List<byte[]> frames,
                                  List<Integer> delays, int avgDelay, long syncId) {
-        MapView mapView = Bukkit.createMap(frame.getWorld());
+        MapView mapView = getOrCreateMapView(frame);
         mapView.getRenderers().forEach(mapView::removeRenderer);
         mapView.setTrackingPosition(false);
         mapView.setUnlimitedTracking(false);

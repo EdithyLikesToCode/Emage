@@ -19,6 +19,8 @@ import javax.imageio.ImageReader;
 import javax.imageio.metadata.IIOMetadata;
 import javax.imageio.metadata.IIOMetadataNode;
 import javax.imageio.stream.ImageInputStream;
+
+import net.edithymaster.emage.Config.EmageConfig;
 import org.w3c.dom.NodeList;
 
 public final class EmageCore {
@@ -30,10 +32,9 @@ public final class EmageCore {
     public static final int MAP_SIZE = 16384;
     public static final int MAP_WIDTH = 128;
 
-    private static final long MAX_DOWNLOAD_BYTES = 50L * 1024 * 1024;
-    private static final int MAX_REDIRECTS = 5;
     private static final AtomicInteger THREAD_COUNTER = new AtomicInteger(0);
     private static final Set<String> ALLOWED_SCHEMES = Set.of("http", "https");
+    private static volatile EmageConfig activeConfig = null;
 
     private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(
             Math.max(1, Runtime.getRuntime().availableProcessors() / 2),
@@ -45,10 +46,10 @@ public final class EmageCore {
             }
     );
 
-    private static final ThreadLocal<double[]> TL_LIN_R = ThreadLocal.withInitial(() -> new double[MAP_SIZE]);
-    private static final ThreadLocal<double[]> TL_LIN_G = ThreadLocal.withInitial(() -> new double[MAP_SIZE]);
-    private static final ThreadLocal<double[]> TL_LIN_B = ThreadLocal.withInitial(() -> new double[MAP_SIZE]);
-    private static final ThreadLocal<boolean[]> TL_TRANSPARENT = ThreadLocal.withInitial(() -> new boolean[MAP_SIZE]);
+    private static final ThreadLocal<double[]> TL_LIN_R = new ThreadLocal<>();
+    private static final ThreadLocal<double[]> TL_LIN_G = new ThreadLocal<>();
+    private static final ThreadLocal<double[]> TL_LIN_B = new ThreadLocal<>();
+    private static final ThreadLocal<boolean[]> TL_TRANSPARENT = new ThreadLocal<>();
 
     private static final ConcurrentLinkedQueue<byte[]> BUFFER_POOL = new ConcurrentLinkedQueue<>();
     private static volatile boolean usePool = true;
@@ -84,6 +85,30 @@ public final class EmageCore {
             }
         }
         return new byte[MAP_SIZE];
+    }
+
+    public static void setConfig(EmageConfig config) {
+        activeConfig = config;
+    }
+
+    private static long getMaxDownloadBytes() {
+        return activeConfig != null ? activeConfig.getMaxDownloadBytes() : 50L * 1024 * 1024;
+    }
+
+    private static int getMaxRedirects() {
+        return activeConfig != null ? activeConfig.getMaxRedirects() : 5;
+    }
+
+    private static int getConnectTimeout() {
+        return activeConfig != null ? activeConfig.getConnectTimeout() : 10000;
+    }
+
+    private static int getReadTimeout() {
+        return activeConfig != null ? activeConfig.getReadTimeout() : 30000;
+    }
+
+    private static boolean shouldBlockInternalUrls() {
+        return activeConfig != null ? activeConfig.blockInternalUrls() : true;
     }
 
     public static void releaseBuffer(byte[] buffer) {
@@ -260,7 +285,7 @@ public final class EmageCore {
         for (int i = 0; i < MAP_SIZE; i++) {
             int rgb = pixels[i];
             if (((rgb >> 24) & 0xFF) < 128) {
-                result[i] = 4;
+                result[i] = 0;
                 continue;
             }
 
@@ -282,10 +307,10 @@ public final class EmageCore {
     private static byte[] ditherFloydSteinberg(int[] pixels) {
         byte[] result = acquireBuffer();
 
-        double[] linR = TL_LIN_R.get();
-        double[] linG = TL_LIN_G.get();
-        double[] linB = TL_LIN_B.get();
-        boolean[] transparent = TL_TRANSPARENT.get();
+        double[] linR = getLinR();
+        double[] linG = getLinG();
+        double[] linB = getLinB();
+        boolean[] transparent = getTransparent();
 
         java.util.Arrays.fill(linR, 0.0);
         java.util.Arrays.fill(linG, 0.0);
@@ -313,7 +338,7 @@ public final class EmageCore {
                 int idx = y * MAP_WIDTH + x;
 
                 if (transparent[idx]) {
-                    result[idx] = 4;
+                    result[idx] = 0;
                     continue;
                 }
 
@@ -372,10 +397,10 @@ public final class EmageCore {
     private static byte[] ditherJarvisGammaCorrected(int[] pixels) {
         byte[] result = acquireBuffer();
 
-        double[] linR = TL_LIN_R.get();
-        double[] linG = TL_LIN_G.get();
-        double[] linB = TL_LIN_B.get();
-        boolean[] transparent = TL_TRANSPARENT.get();
+        double[] linR = getLinR();
+        double[] linG = getLinG();
+        double[] linB = getLinB();
+        boolean[] transparent = getTransparent();
 
         java.util.Arrays.fill(linR, 0.0);
         java.util.Arrays.fill(linG, 0.0);
@@ -398,7 +423,7 @@ public final class EmageCore {
                 int idx = y * MAP_WIDTH + x;
 
                 if (transparent[idx]) {
-                    result[idx] = 4;
+                    result[idx] = 0;
                     continue;
                 }
 
@@ -553,7 +578,7 @@ public final class EmageCore {
     }
 
     private static InputStream openLimitedStream(URL url) throws IOException {
-        return openLimitedStream(url, MAX_REDIRECTS);
+        return openLimitedStream(url, getMaxRedirects());
     }
 
     private static InputStream openLimitedStream(URL url, int remainingRedirects) throws IOException {
@@ -565,82 +590,110 @@ public final class EmageCore {
             throw new IOException("Too many redirects");
         }
 
-        java.net.InetAddress address;
-        try {
-            Future<java.net.InetAddress> dnsFuture = EXECUTOR.submit(
-                    () -> java.net.InetAddress.getByName(url.getHost()));
-            address = dnsFuture.get(5, TimeUnit.SECONDS);
-        } catch (TimeoutException e) {
-            throw new IOException("DNS resolution timed out for host: " + url.getHost());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("DNS resolution interrupted");
-        } catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            throw new IOException("DNS resolution failed: " + (cause != null ? cause.getMessage() : e.getMessage()));
-        }
-
-        if (address.isLoopbackAddress() || address.isLinkLocalAddress() || address.isSiteLocalAddress() || address.isAnyLocalAddress()) {
-            throw new IOException("URLs pointing to internal/local networks are not allowed");
-        }
+        resolveAndValidate(url.getHost());
 
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setInstanceFollowRedirects(false);
         conn.setRequestMethod("GET");
-        conn.setConnectTimeout(10000);
-        conn.setReadTimeout(30000);
+        conn.setConnectTimeout(getConnectTimeout());
+        conn.setReadTimeout(getReadTimeout());
         conn.setRequestProperty("User-Agent", "Mozilla/5.0 Emage-Plugin");
+        conn.setRequestProperty("Host", url.getHost());
+
+        conn.connect();
+
+        resolveAndValidate(url.getHost());
 
         int status = conn.getResponseCode();
         if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
             String redirect = conn.getHeaderField("Location");
             conn.disconnect();
             if (redirect != null) {
-                URL redirectUrl = new URL(redirect);
-
-                java.net.InetAddress redirAddr;
-                try {
-                    Future<java.net.InetAddress> dnsFuture = EXECUTOR.submit(
-                            () -> java.net.InetAddress.getByName(redirectUrl.getHost()));
-                    redirAddr = dnsFuture.get(5, TimeUnit.SECONDS);
-                } catch (TimeoutException e) {
-                    throw new IOException("DNS resolution timed out for redirect host: " + redirectUrl.getHost());
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("DNS resolution interrupted on redirect");
-                } catch (ExecutionException e) {
-                    Throwable cause = e.getCause();
-                    throw new IOException("DNS resolution failed on redirect: " + (cause != null ? cause.getMessage() : e.getMessage()));
-                }
-
-                if (redirAddr.isLoopbackAddress() || redirAddr.isLinkLocalAddress() || redirAddr.isSiteLocalAddress() || redirAddr.isAnyLocalAddress()) {
-                    throw new IOException("Redirect to internal network blocked");
-                }
+                URL redirectUrl = new URL(url, redirect);
+                resolveAndValidate(redirectUrl.getHost());
                 return openLimitedStream(redirectUrl, remainingRedirects - 1);
             }
             throw new IOException("Redirect without Location header");
         }
 
-        long contentLength = conn.getContentLengthLong();
-        if (contentLength > MAX_DOWNLOAD_BYTES) {
+        if (status != 200) {
             conn.disconnect();
-            throw new IOException("File too large: " + contentLength + " bytes");
+            throw new IOException("HTTP error: " + status);
         }
 
-        return new LimitedInputStream(conn.getInputStream(), MAX_DOWNLOAD_BYTES);
+        long maxBytes = getMaxDownloadBytes();
+        long contentLength = conn.getContentLengthLong();
+        if (contentLength > maxBytes) {
+            conn.disconnect();
+            throw new IOException("File too large: " + contentLength + " bytes (max " + maxBytes + ")");
+        }
+
+        return new LimitedInputStream(conn.getInputStream(), maxBytes);
+    }
+
+    private static java.net.InetAddress resolveAndValidate(String host) throws IOException {
+        java.net.InetAddress address;
+        try {
+            Future<java.net.InetAddress> dnsFuture = EXECUTOR.submit(
+                    () -> java.net.InetAddress.getByName(host));
+            address = dnsFuture.get(5, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            throw new IOException("DNS resolution timed out for host: " + host);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("DNS resolution interrupted");
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            throw new IOException("DNS resolution failed: " +
+                    (cause != null ? cause.getMessage() : e.getMessage()));
+        }
+
+        validateAddress(address);
+        return address;
+    }
+
+    private static void validateAddress(java.net.InetAddress address) throws IOException {
+        if (!shouldBlockInternalUrls()) return;
+
+        if (address.isLoopbackAddress() ||
+                address.isLinkLocalAddress() ||
+                address.isSiteLocalAddress() ||
+                address.isAnyLocalAddress()) {
+            throw new IOException("URLs pointing to internal/local networks are not allowed");
+        }
+
+        byte[] bytes = address.getAddress();
+        if (bytes.length == 16) {
+            boolean isMapped = true;
+            for (int i = 0; i < 10; i++) {
+                if (bytes[i] != 0) { isMapped = false; break; }
+            }
+            if (isMapped && bytes[10] == (byte) 0xFF && bytes[11] == (byte) 0xFF) {
+                byte[] v4 = new byte[]{bytes[12], bytes[13], bytes[14], bytes[15]};
+                java.net.InetAddress v4Addr = java.net.InetAddress.getByAddress(v4);
+                if (v4Addr.isLoopbackAddress() ||
+                        v4Addr.isLinkLocalAddress() ||
+                        v4Addr.isSiteLocalAddress() ||
+                        v4Addr.isAnyLocalAddress()) {
+                    throw new IOException("URLs pointing to internal/local networks are not allowed");
+                }
+            }
+        }
     }
 
     private static class LimitedInputStream extends FilterInputStream {
         private long remaining;
+        private final long limit;
 
         LimitedInputStream(InputStream in, long limit) {
             super(in);
             this.remaining = limit;
+            this.limit = limit;
         }
 
         @Override
         public int read() throws IOException {
-            if (remaining <= 0) throw new IOException("Download size limit exceeded (" + MAX_DOWNLOAD_BYTES + " bytes)");
+            if (remaining <= 0) throw new IOException("Download size limit exceeded (" + limit + " bytes)");
             int b = super.read();
             if (b >= 0) remaining--;
             return b;
@@ -648,7 +701,7 @@ public final class EmageCore {
 
         @Override
         public int read(byte[] b, int off, int len) throws IOException {
-            if (remaining <= 0) throw new IOException("Download size limit exceeded (" + MAX_DOWNLOAD_BYTES + " bytes)");
+            if (remaining <= 0) throw new IOException("Download size limit exceeded (" + limit + " bytes)");
             int toRead = (int) Math.min(len, remaining);
             int read = super.read(b, off, toRead);
             if (read > 0) remaining -= read;
@@ -659,6 +712,11 @@ public final class EmageCore {
     private static GifData readGif(URL url, int maxFrames) throws Exception {
         List<BufferedImage> frames = new ArrayList<>();
         List<Integer> delays = new ArrayList<>();
+
+        long maxDecodedBytes = activeConfig != null
+                ? activeConfig.getMaxMemoryMB() * 1024 * 1024
+                : 256L * 1024 * 1024;
+        long totalDecodedBytes = 0;
 
         try (InputStream is = new BufferedInputStream(openLimitedStream(url), 65536);
              ImageInputStream iis = ImageIO.createImageInputStream(is)) {
@@ -693,6 +751,12 @@ public final class EmageCore {
                 }
             } catch (Exception e) {
                 logger.log(Level.FINE, "Could not read GIF logical screen descriptor", e);
+            }
+
+            if (canvasWidth > 4096 || canvasHeight > 4096) {
+                reader.dispose();
+                throw new Exception("GIF dimensions too large: " + canvasWidth + "x" + canvasHeight +
+                        " (max 4096x4096)");
             }
 
             Color gifBackgroundColor = null;
@@ -739,6 +803,13 @@ public final class EmageCore {
                 canvasHeight = firstFrame.getHeight();
             }
 
+            long canvasBytes = (long) canvasWidth * canvasHeight * 4;
+            if (canvasBytes > maxDecodedBytes / 4) {
+                reader.dispose();
+                throw new Exception("GIF canvas too large: would require " +
+                        (canvasBytes / 1024 / 1024) + "MB per frame");
+            }
+
             BufferedImage canvas = new BufferedImage(canvasWidth, canvasHeight, BufferedImage.TYPE_INT_ARGB);
             Graphics2D canvasG = canvas.createGraphics();
             canvasG.setBackground(new Color(0, 0, 0, 0));
@@ -757,6 +828,14 @@ public final class EmageCore {
                     break;
                 }
                 if (rawFrame == null) break;
+
+                long frameBytes = (long) rawFrame.getWidth() * rawFrame.getHeight() * 4;
+                totalDecodedBytes += frameBytes + canvasBytes; // frame + canvas copy
+                if (totalDecodedBytes > maxDecodedBytes) {
+                    logger.warning("GIF exceeded decoded memory limit at frame " + i +
+                            " (" + (totalDecodedBytes / 1024 / 1024) + "MB). Truncating.");
+                    break;
+                }
 
                 int delay = 50;
                 String disposal = "none";
@@ -826,7 +905,47 @@ public final class EmageCore {
             reader.dispose();
         }
 
+        if (frames.isEmpty()) {
+            throw new Exception("No frames could be decoded from GIF");
+        }
+
         return new GifData(frames, delays);
+    }
+
+    private static double[] getLinR() {
+        double[] arr = TL_LIN_R.get();
+        if (arr == null) {
+            arr = new double[MAP_SIZE];
+            TL_LIN_R.set(arr);
+        }
+        return arr;
+    }
+
+    private static double[] getLinG() {
+        double[] arr = TL_LIN_G.get();
+        if (arr == null) {
+            arr = new double[MAP_SIZE];
+            TL_LIN_G.set(arr);
+        }
+        return arr;
+    }
+
+    private static double[] getLinB() {
+        double[] arr = TL_LIN_B.get();
+        if (arr == null) {
+            arr = new double[MAP_SIZE];
+            TL_LIN_B.set(arr);
+        }
+        return arr;
+    }
+
+    private static boolean[] getTransparent() {
+        boolean[] arr = TL_TRANSPARENT.get();
+        if (arr == null) {
+            arr = new boolean[MAP_SIZE];
+            TL_TRANSPARENT.set(arr);
+        }
+        return arr;
     }
 
     private static BufferedImage copyImage(BufferedImage src) {
@@ -855,7 +974,20 @@ public final class EmageCore {
                 return new AnimData(frames, grid.delays, avg, grid.syncId);
             }
         } catch (Exception e) {
-            logger.log(Level.FINE, "Failed to decompress animation data", e);
+            logger.log(Level.FINE, "Failed to decompress animation data via grid format", e);
+        }
+
+        try {
+            byte[] mapData = EmageCompression.decompressSingleStatic(data);
+            if (mapData != null && mapData.length == MAP_SIZE) {
+                List<byte[]> frames = new ArrayList<>();
+                frames.add(mapData);
+                List<Integer> delays = new ArrayList<>();
+                delays.add(100);
+                return new AnimData(frames, delays, 100, 0L);
+            }
+        } catch (Exception e) {
+            logger.log(Level.FINE, "Failed to decompress animation as static fallback", e);
         }
 
         List<byte[]> frames = new ArrayList<>();
@@ -875,7 +1007,23 @@ public final class EmageCore {
             EXECUTOR.shutdownNow();
             Thread.currentThread().interrupt();
         }
+
+        TL_LIN_R.remove();
+        TL_LIN_G.remove();
+        TL_LIN_B.remove();
+        TL_TRANSPARENT.remove();
+
         clearAllPools();
+    }
+
+    public static BufferedImage downloadImage(URL url) throws Exception {
+        try (InputStream is = new BufferedInputStream(openLimitedStream(url), 65536)) {
+            BufferedImage img = ImageIO.read(is);
+            if (img == null) {
+                throw new IOException("Failed to decode image");
+            }
+            return img;
+        }
     }
 
     private static class GifData {

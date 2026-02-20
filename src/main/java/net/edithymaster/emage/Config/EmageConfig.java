@@ -20,10 +20,10 @@ public class EmageConfig {
     private final AtomicLong totalMemoryUsed = new AtomicLong(0);
     private final AtomicLong lastAdaptCheck = new AtomicLong(0);
 
-    private volatile int effectiveFps = 60;
-    private volatile int effectiveRenderDistance = 64;
-    private volatile int effectiveUpdateInterval = 1;
-    private volatile boolean effectiveDistanceCulling = true;
+    private volatile int effectiveFps;
+    private volatile int effectiveRenderDistance;
+    private volatile int effectiveUpdateInterval;
+    private volatile boolean effectiveDistanceCulling;
 
     // Performance
     private int maxRenderDistance;
@@ -104,11 +104,33 @@ public class EmageConfig {
         cooldownMs = config.getLong("rate-limits.cooldown-seconds", 5) * 1000;
         maxConcurrentTasks = config.getInt("rate-limits.max-concurrent-tasks", 3);
 
-        // Apply
         effectiveFps = maxFps;
         effectiveRenderDistance = maxRenderDistance;
         effectiveUpdateInterval = 1;
         effectiveDistanceCulling = true;
+
+        if (maxFps < 1) maxFps = 1;
+        if (minFps < 1) minFps = 1;
+        if (minFps > maxFps) minFps = maxFps;
+        if (maxPacketsPerTick < 1) maxPacketsPerTick = 1;
+        if (maxRenderDistance < 8) maxRenderDistance = 8;
+        if (maxGifFrames < 1) maxGifFrames = 1;
+        if (maxGridSize < 1) maxGridSize = 1;
+        if (maxGifGridSize < 1) maxGifGridSize = 1;
+        if (maxImageGridSize < 1) maxImageGridSize = 1;
+        if (poolSize < 0) poolSize = 0;
+        if (maxMemoryMB < 32) maxMemoryMB = 32;
+        if (maxDownloadBytes < 1024 * 1024) maxDownloadBytes = 1024 * 1024;
+        if (connectTimeout < 1000) connectTimeout = 1000;
+        if (readTimeout < 1000) readTimeout = 1000;
+        if (maxRedirects < 0) maxRedirects = 0;
+        if (cacheMaxEntries < 0) cacheMaxEntries = 0;
+        if (cacheExpireMs < 60000) cacheExpireMs = 60000;
+        if (cooldownMs < 0) cooldownMs = 0;
+        if (maxConcurrentTasks < 1) maxConcurrentTasks = 1;
+
+        effectiveFps = maxFps;
+        effectiveRenderDistance = maxRenderDistance;
 
         EmageCore.setUsePool(useMemoryPool);
         EmageCore.setMaxPoolSize(poolSize);

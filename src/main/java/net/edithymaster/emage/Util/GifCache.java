@@ -13,12 +13,12 @@ public final class GifCache {
 
     private GifCache() {}
 
-    private static final int MAX_ENTRIES = 20;
-    private static final long MAX_MEMORY_BYTES = 100L * 1024 * 1024;
-    private static final long EXPIRE_TIME_MS = 30L * 60 * 1000;
+    private static volatile int maxEntries = 20;
+    private static volatile long maxMemoryBytes = 100L * 1024 * 1024;
+    private static volatile long expireTimeMs = 30L * 60 * 1000;
 
     private static final Map<String, CacheEntry> CACHE = Collections.synchronizedMap(
-            new LinkedHashMap<>(MAX_ENTRIES + 1, 0.75f, true) {
+            new LinkedHashMap<>(maxEntries + 1, 0.75f, true) {
                 @Override
                 protected boolean removeEldestEntry(Map.Entry<String, CacheEntry> eldest) {
                     return false;
@@ -34,6 +34,12 @@ public final class GifCache {
 
     public static void init(Logger log) {
         logger = log;
+    }
+
+    public static void configure(int entries, long memoryBytes, long expireMs) {
+        maxEntries = Math.max(1, entries);
+        maxMemoryBytes = Math.max(1024 * 1024, memoryBytes);
+        expireTimeMs = Math.max(60000, expireMs);
     }
 
     private static class CacheEntry {
@@ -63,7 +69,7 @@ public final class GifCache {
         }
 
         boolean isExpired() {
-            return System.currentTimeMillis() - lastAccessed > EXPIRE_TIME_MS;
+            return System.currentTimeMillis() - lastAccessed > expireTimeMs;
         }
     }
 
@@ -129,7 +135,7 @@ public final class GifCache {
         Iterator<Map.Entry<String, CacheEntry>> it = CACHE.entrySet().iterator();
         while (it.hasNext()) {
             Map.Entry<String, CacheEntry> e = it.next();
-            if (now - e.getValue().lastAccessed > EXPIRE_TIME_MS) {
+            if (now - e.getValue().lastAccessed > expireTimeMs) {
                 totalSizeBytes.addAndGet(-e.getValue().sizeBytes);
                 it.remove();
             }
@@ -137,11 +143,11 @@ public final class GifCache {
     }
 
     private static void evictIfNeeded(long incomingSize) {
-        while (CACHE.size() >= MAX_ENTRIES) {
+        while (CACHE.size() >= maxEntries) {
             evictOldest();
         }
 
-        while (totalSizeBytes.get() + incomingSize > MAX_MEMORY_BYTES && !CACHE.isEmpty()) {
+        while (totalSizeBytes.get() + incomingSize > maxMemoryBytes && !CACHE.isEmpty()) {
             evictOldest();
         }
     }

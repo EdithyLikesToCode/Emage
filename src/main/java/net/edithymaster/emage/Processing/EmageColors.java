@@ -1,12 +1,14 @@
 package net.edithymaster.emage.Processing;
 
+import org.bukkit.Bukkit;
+
 import java.awt.Color;
 
 public final class EmageColors {
 
     private EmageColors() {}
 
-    private static final int MAX_VALID_INDEX = 220;
+    private static final int MAX_VALID_INDEX = detectMaxValidIndex();
 
     private static final int[][] PALETTE = {
             {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0},
@@ -72,6 +74,13 @@ public final class EmageColors {
             {152, 123, 103}, {186, 150, 126}, {216, 175, 147}, {114, 92, 77},
             {89, 117, 105}, {109, 144, 129}, {127, 167, 150}, {67, 88, 79},
             {105, 85, 98}, {128, 103, 120}, {148, 120, 138}, {78, 63, 73},
+            {100, 100, 100}, {122, 122, 122}, {142, 142, 142}, {75, 75, 75},
+            {152, 123, 103}, {186, 150, 126}, {216, 175, 147}, {114, 92, 77},
+            {89, 117, 105}, {109, 144, 129}, {127, 167, 150}, {67, 88, 79},
+            {105, 85, 98}, {128, 103, 120}, {148, 120, 138}, {78, 63, 73},
+            {122, 94, 68}, {149, 115, 83}, {174, 134, 97}, {91, 70, 51},
+            {76, 60, 42}, {93, 74, 52}, {108, 86, 60}, {57, 45, 31},
+            {78, 22, 9}, {95, 27, 11}, {110, 31, 13}, {58, 16, 7},
             {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0},
     };
 
@@ -125,6 +134,22 @@ public final class EmageColors {
                 srgb = 1.055 * Math.pow(linear, 1.0 / 2.4) - 0.055;
             }
             DELIN_TABLE[i] = Math.max(0, Math.min(255, (int) Math.round(srgb * 255.0)));
+        }
+    }
+
+    private static int detectMaxValidIndex() {
+        try {
+            String version = Bukkit.getBukkitVersion();
+            String[] parts = version.split("[.-]");
+            int major = Integer.parseInt(parts[0]);
+            int minor = Integer.parseInt(parts[1]);
+
+            if (major > 1 || (major == 1 && minor >= 17)) {
+                return 236;
+            }
+            return 208;
+        } catch (Exception e) {
+            return 208;
         }
     }
 

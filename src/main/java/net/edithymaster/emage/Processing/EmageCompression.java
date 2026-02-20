@@ -712,15 +712,50 @@ public final class EmageCompression {
 
     private static AnimGridData decompressLegacyAnimGrid(byte[] data) {
         try {
-            EmageCore.AnimData animData = EmageCore.decompressAnim(data);
-            if (animData != null && !animData.frames.isEmpty()) {
-                Map<Integer, List<byte[]>> cells = new HashMap<>();
-                cells.put(0, animData.frames);
-                return new AnimGridData(animData.syncId, cells, animData.delays);
+            if (data.length < 3) return null;
+
+            ByteArrayInputStream bais = new ByteArrayInputStream(data);
+            DataInputStream dis = new DataInputStream(bais);
+
+            int m1 = dis.readByte() & 0xFF;
+            int m2 = dis.readByte() & 0xFF;
+            int version = dis.readByte() & 0xFF;
+
+            if (m1 == 'E' && m2 == 'M') {
+                byte[] mapData;
+
+                if (version == '0') {
+                    int originalSize = dis.readInt();
+                    int compressedSize = dis.readInt();
+                    byte[] compressed = new byte[compressedSize];
+                    dis.readFully(compressed);
+                    mapData = inflate(compressed, originalSize);
+                } else if (version == '1') {
+                    dis.close();
+                    mapData = decompressSingleStatic(data);
+                } else {
+                    dis.close();
+                    return null;
+                }
+
+                dis.close();
+
+                if (mapData != null && mapData.length == MAP_SIZE) {
+                    List<byte[]> frames = new ArrayList<>();
+                    frames.add(mapData);
+                    List<Integer> delays = new ArrayList<>();
+                    delays.add(100);
+                    Map<Integer, List<byte[]>> cells = new HashMap<>();
+                    cells.put(0, frames);
+                    return new AnimGridData(0L, cells, delays);
+                }
             }
+
+            dis.close();
         } catch (Exception e) {
             logger.log(Level.FINE, "Legacy animation decompression failed", e);
         }
+
         return null;
     }
 

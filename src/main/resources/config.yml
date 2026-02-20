@@ -15,18 +15,18 @@ performance:
   adaptive: true
 
   # GIF animation frame rate limits
-  # Values above 60 are NOT recommended
-  max-fps: 60
+  # Values above 30 are NOT recommended
+  max-fps: 30
   min-fps: 20
 
   # Maximum distance (in blocks) at which animated maps
   # will send frame updates to players
   # Lower = less bandwidth, higher = visible from further away
-  max-render-distance: 64
+  max-render-distance: 32
 
   # Maximum map update packets sent per player per tick
   # Lower = less lag spikes, higher = smoother animations with many maps
-  max-packets-per-tick: 60
+  max-packets-per-tick: 32
 
 # ─────────────────────────────────────────────────
 #  Memory
@@ -77,7 +77,7 @@ downloads:
   read-timeout: 30
 
   # Maximum number of HTTP redirects to follow (default recommended)
-  max-redirects: 1
+  max-redirects: 5
 
   # Block downloads from local/internal network addresses (default recommended)
   block-internal-urls: true

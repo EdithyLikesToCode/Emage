@@ -18,6 +18,7 @@ import java.io.*;
 import java.nio.file.Files;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 
 public final class EmageManager implements Listener {
@@ -34,7 +35,7 @@ public final class EmageManager implements Listener {
     private final Map<Long, PendingAnimGrid> pendingAnimGrids = new ConcurrentHashMap<>();
 
     private final Set<Integer> pendingMapInits = ConcurrentHashMap.newKeySet();
-    private volatile boolean mapInitTaskScheduled = false;
+    private final AtomicBoolean mapInitTaskScheduled = new AtomicBoolean(false);
 
     private final ExecutorService ioExecutor;
     private final ScheduledExecutorService scheduler;
@@ -101,10 +102,18 @@ public final class EmageManager implements Listener {
             config.incrementMapCount();
         }
 
-        PendingStaticGrid grid = pendingStaticGrids.computeIfAbsent(gridId,
-                k -> new PendingStaticGrid(gridId));
-        grid.addCell(mapId, data);
-        grid.scheduleSave();
+        synchronized (pendingStaticGrids) {
+            PendingStaticGrid grid = pendingStaticGrids.get(gridId);
+            if (grid != null && grid.saving) {
+                grid = null;
+            }
+            if (grid == null) {
+                grid = new PendingStaticGrid(gridId);
+                pendingStaticGrids.put(gridId, grid);
+            }
+            grid.addCell(mapId, data);
+            grid.scheduleSave();
+        }
     }
 
     public void saveGif(int mapId, List<byte[]> frames, List<Integer> delays, int avgDelay, long syncId) {
@@ -116,17 +125,25 @@ public final class EmageManager implements Listener {
             config.incrementAnimationCount();
         }
 
-        PendingAnimGrid grid = pendingAnimGrids.computeIfAbsent(syncId,
-                k -> new PendingAnimGrid(syncId, delays));
-        grid.addCell(mapId, frames);
-        grid.scheduleSave();
+        synchronized (pendingAnimGrids) {
+            PendingAnimGrid grid = pendingAnimGrids.get(syncId);
+            if (grid != null && grid.saving) {
+                grid = null;
+            }
+            if (grid == null) {
+                grid = new PendingAnimGrid(syncId, delays);
+                pendingAnimGrids.put(syncId, grid);
+            }
+            grid.addCell(mapId, frames);
+            grid.scheduleSave();
+        }
     }
 
     private class PendingStaticGrid {
         final long gridId;
         final Map<Integer, byte[]> cells = new ConcurrentHashMap<>();
         private ScheduledFuture<?> saveTask;
-        private volatile boolean saving = false;
+        volatile boolean saving = false;
 
         PendingStaticGrid(long gridId) {
             this.gridId = gridId;
@@ -142,10 +159,18 @@ public final class EmageManager implements Listener {
             saveTask = scheduler.schedule(this::saveNow, 500, TimeUnit.MILLISECONDS);
         }
 
-        synchronized void saveNow() {
-            if (saving) return;
-            saving = true;
-            pendingStaticGrids.remove(gridId);
+        void saveNow() {
+            synchronized (this) {
+                if (saving) return;
+                saving = true;
+            }
+
+            synchronized (pendingStaticGrids) {
+                PendingStaticGrid current = pendingStaticGrids.get(gridId);
+                if (current == this) {
+                    pendingStaticGrids.remove(gridId);
+                }
+            }
 
             final Map<Integer, byte[]> cellsCopy = new HashMap<>(cells);
 
@@ -178,12 +203,13 @@ public final class EmageManager implements Listener {
         }
     }
 
+
     private class PendingAnimGrid {
         final long syncId;
         final List<Integer> delays;
         final Map<Integer, List<byte[]>> cells = new ConcurrentHashMap<>();
         private ScheduledFuture<?> saveTask;
-        private volatile boolean saving = false;
+        volatile boolean saving = false;
 
         PendingAnimGrid(long syncId, List<Integer> delays) {
             this.syncId = syncId;
@@ -200,10 +226,18 @@ public final class EmageManager implements Listener {
             saveTask = scheduler.schedule(this::saveNow, 2000, TimeUnit.MILLISECONDS);
         }
 
-        synchronized void saveNow() {
-            if (saving) return;
-            saving = true;
-            pendingAnimGrids.remove(syncId);
+        void saveNow() {
+            synchronized (this) {
+                if (saving) return;
+                saving = true;
+            }
+
+            synchronized (pendingAnimGrids) {
+                PendingAnimGrid current = pendingAnimGrids.get(syncId);
+                if (current == this) {
+                    pendingAnimGrids.remove(syncId);
+                }
+            }
 
             final Map<Integer, List<byte[]>> cellsCopy = new HashMap<>(cells);
             final List<Integer> delaysCopy = new ArrayList<>(delays);
@@ -379,10 +413,9 @@ public final class EmageManager implements Listener {
 
         pendingMapInits.add(mapId);
 
-        if (!mapInitTaskScheduled) {
-            mapInitTaskScheduled = true;
+        if (mapInitTaskScheduled.compareAndSet(false, true)) {
             Bukkit.getScheduler().runTaskLater(plugin, () -> {
-                mapInitTaskScheduled = false;
+                mapInitTaskScheduled.set(false);
                 Set<Integer> toApply = new HashSet<>(pendingMapInits);
                 pendingMapInits.clear();
 
@@ -481,6 +514,8 @@ public final class EmageManager implements Listener {
                     if (file.delete()) {
                         deleted++;
                         for (int mapId : fileMapIds) {
+                            removeRenderers(mapId);
+
                             managedMaps.remove(mapId);
                             mapCache.remove(mapId);
                             appliedMaps.remove(mapId);
@@ -507,6 +542,21 @@ public final class EmageManager implements Listener {
             }
         }
         return false;
+    }
+
+    private void removeRenderers(int mapId) {
+        @SuppressWarnings("deprecation")
+        MapView mapView = Bukkit.getMap(mapId);
+        if (mapView != null) {
+            for (org.bukkit.map.MapRenderer renderer : new ArrayList<>(mapView.getRenderers())) {
+                if (renderer instanceof GifRenderer gifRenderer) {
+                    gifRenderer.remove();
+                }
+                mapView.removeRenderer(renderer);
+            }
+        }
+
+        GifRenderer.removeByMapId(mapId);
     }
 
     private Set<Integer> getMapIdsFromGridFile(File file) {
@@ -619,6 +669,23 @@ public final class EmageManager implements Listener {
             this.avgDelay = avgDelay;
             this.syncId = syncId;
             this.isAnimation = isAnimation;
+        }
+    }
+
+    public void removeMap(int mapId) {
+        managedMaps.remove(mapId);
+        mapCache.remove(mapId);
+        appliedMaps.remove(mapId);
+
+        @SuppressWarnings("deprecation")
+        MapView mapView = Bukkit.getMap(mapId);
+        if (mapView != null) {
+            for (org.bukkit.map.MapRenderer renderer : mapView.getRenderers()) {
+                if (renderer instanceof GifRenderer gifRenderer) {
+                    gifRenderer.remove();
+                }
+                mapView.removeRenderer(renderer);
+            }
         }
     }
 

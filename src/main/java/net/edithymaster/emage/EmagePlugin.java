@@ -1,5 +1,8 @@
 package net.edithymaster.emage;
 
+import org.bstats.bukkit.Metrics;
+import org.bstats.charts.SimplePie;
+import org.bstats.charts.SingleLineChart;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -23,6 +26,9 @@ public final class EmagePlugin extends JavaPlugin {
 
     @Override
     public void onEnable() {
+        int pluginID = 29638;
+        Metrics metrics = new Metrics(this, pluginID);
+
         saveDefaultConfig();
         backfillConfig();
 
@@ -34,7 +40,14 @@ public final class EmagePlugin extends JavaPlugin {
 
         emageConfig = new EmageConfig(this);
 
+        EmageCore.setConfig(emageConfig);
+
         GifCache.init(getLogger());
+        GifCache.configure(
+                emageConfig.getCacheMaxEntries(),
+                emageConfig.getCacheMaxMemoryBytes(),
+                emageConfig.getCacheExpireMs()
+        );
         GifRenderer.init(this, emageConfig);
 
         manager = new EmageManager(this, emageConfig);
@@ -48,6 +61,7 @@ public final class EmagePlugin extends JavaPlugin {
         }
 
         manager.loadAllMaps();
+        registerCustomMetrics(metrics);
 
         if (getConfig().getBoolean("check-updates", true)) {
             Bukkit.getScheduler().runTaskLaterAsynchronously(this, () -> {
@@ -82,6 +96,10 @@ public final class EmagePlugin extends JavaPlugin {
     public void onDisable() {
         GifRenderer.stop();
 
+        if (manager != null) {
+            manager.shutdown();
+        }
+
         EmageCore.shutdown();
 
         int cached = GifCache.clearCache();
@@ -89,11 +107,41 @@ public final class EmagePlugin extends JavaPlugin {
             getLogger().info("Cleared " + cached + " cached GIFs.");
         }
 
-        if (manager != null) {
-            manager.shutdown();
-        }
-
         getLogger().info("Emage disabled!");
+    }
+
+    private void registerCustomMetrics(Metrics metrics) {
+
+        metrics.addCustomChart(new SingleLineChart("total_maps", () ->
+                manager.getStats().activeMaps
+        ));
+
+        metrics.addCustomChart(new SingleLineChart("total_animations", () ->
+                manager.getStats().animations
+        ));
+
+        metrics.addCustomChart(new SimplePie("uses_animations", () ->
+                manager.getStats().animations > 0 ? "Yes" : "No"
+        ));
+
+        metrics.addCustomChart(new SimplePie("maps_range", () -> {
+            int count = manager.getStats().activeMaps;
+            if (count == 0) return "None";
+            if (count <= 5) return "1-5";
+            if (count <= 15) return "6-15";
+            if (count <= 50) return "16-50";
+            if (count <= 100) return "51-100";
+            return "100+";
+        }));
+
+        metrics.addCustomChart(new SimplePie("dither_quality", () -> {
+            String quality = getConfig().getString("quality.default-dither", "BALANCED");
+            return quality != null ? quality.toUpperCase() : "BALANCED";
+        }));
+
+        metrics.addCustomChart(new SimplePie("adaptive_performance", () ->
+                emageConfig.isAdaptivePerformance() ? "Enabled" : "Disabled"
+        ));
     }
 
     public String getPrefix() {
