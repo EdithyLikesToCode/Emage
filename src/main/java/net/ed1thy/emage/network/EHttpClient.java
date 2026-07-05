@@ -8,7 +8,6 @@ import java.security.Security;
 import java.time.Duration;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 public class EHttpClient {
 
@@ -16,16 +15,15 @@ public class EHttpClient {
     private final int connectTimeoutSeconds;
     private final int readTimeoutSeconds;
 
-    public EHttpClient(@NotNull ConfigManager configManager) {
+    public EHttpClient(@NotNull ConfigManager configManager, @NotNull ExecutorService virtualThreadExecutor) {
         this.connectTimeoutSeconds = configManager.connectTimeoutSeconds;
         this.readTimeoutSeconds = configManager.readTimeoutSeconds;
 
         Security.setProperty("networkaddress.cache.ttl", "30");
         Security.setProperty("networkaddress.cache.negative.ttl", "0");
 
-        ExecutorService internalPool = Executors.newCachedThreadPool();
         Executor emageExecutor = command -> {
-            internalPool.submit(() -> {
+            virtualThreadExecutor.submit(() -> {
                 DnsResolver.EMAGE_HTTP_FLAG.set(Boolean.TRUE);
                 try {
                     command.run();

@@ -48,17 +48,6 @@ public class SchemaInitializer {
                 );
                 """;
 
-        String createFrameDataTable = """
-                CREATE TABLE IF NOT EXISTS emage_frame_data (
-                    sync_group_id INTEGER NOT NULL,
-                    frame_index INTEGER NOT NULL,
-                    uncompressed_size INTEGER NOT NULL,
-                    data BLOB NOT NULL,
-                    PRIMARY KEY (sync_group_id, frame_index),
-                    FOREIGN KEY (sync_group_id) REFERENCES emage_metadata(sync_group_id) ON DELETE CASCADE
-                );
-                """;
-
         String createSchemaVersionTable = """
                 CREATE TABLE IF NOT EXISTS emage_schema_version (
                     id INTEGER PRIMARY KEY,
@@ -73,12 +62,13 @@ public class SchemaInitializer {
             statement.execute(createMetadataTable);
             statement.execute(createMapIdsTable);
             statement.execute(createPlacedFramesTable);
-            statement.execute(createFrameDataTable);
 
             statement.execute("CREATE INDEX IF NOT EXISTS idx_emage_maps_group ON emage_maps(sync_group_id);");
             statement.execute("CREATE INDEX IF NOT EXISTS idx_emage_frames_chunk ON emage_placed_frames(world_uuid, chunk_x, chunk_z);");
             statement.execute("CREATE INDEX IF NOT EXISTS idx_emage_frames_group ON emage_placed_frames(sync_group_id);");
-            statement.execute("CREATE INDEX IF NOT EXISTS idx_emage_frame_data_group ON emage_frame_data(sync_group_id);");
+
+            statement.execute("CREATE INDEX IF NOT EXISTS idx_emage_metadata_hash ON emage_metadata(file_hash, columns, rows);");
+            statement.execute("CREATE INDEX IF NOT EXISTS idx_emage_metadata_url ON emage_metadata(source_url, columns, rows);");
 
             statement.execute("INSERT OR IGNORE INTO sqlite_sequence (name, seq) VALUES ('emage_maps', 1000000);");
             statement.execute("UPDATE sqlite_sequence SET seq = 1000000 WHERE name = 'emage_maps' AND seq > 1000000000;");
@@ -117,5 +107,13 @@ public class SchemaInitializer {
             currentVersion = 1;
         }
 
+        if (currentVersion < 2) {
+            try (Statement stmt = connection.createStatement()) {
+                stmt.execute("DROP TABLE IF EXISTS emage_frame_data;");
+            }
+            try (PreparedStatement ps = connection.prepareStatement("INSERT OR REPLACE INTO emage_schema_version (id, version) VALUES (1, 2)")) {
+                ps.executeUpdate();
+            }
+        }
     }
 }

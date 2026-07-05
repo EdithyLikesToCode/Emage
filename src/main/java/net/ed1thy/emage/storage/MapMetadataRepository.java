@@ -9,28 +9,58 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 
 public class MapMetadataRepository {
 
     private final DatabaseManager dbManager;
+    private final ExecutorService dbWriteExecutor;
 
-    public MapMetadataRepository(@NotNull DatabaseManager dbManager) {
+    public MapMetadataRepository(@NotNull DatabaseManager dbManager, @NotNull ExecutorService dbWriteExecutor) {
         this.dbManager = dbManager;
+        this.dbWriteExecutor = dbWriteExecutor;
+    }
+
+    public void shutdown() {}
+
+    private void executeWrite(IoAction action) throws SQLException {
+        try {
+            dbWriteExecutor.submit(() -> {
+                try { action.run(); } catch (SQLException e) { throw new RuntimeException(e); }
+            }).get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new SQLException("Thread interrupted during database write", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException && cause.getCause() instanceof SQLException sqlEx) {
+                throw sqlEx;
+            }
+            throw new SQLException("Failed to execute database write", cause);
+        }
+    }
+
+    @FunctionalInterface
+    private interface IoAction {
+        void run() throws SQLException;
     }
 
     public void addPlacedFrames(int syncGroupId, List<ItemFrame> frames) throws SQLException {
-        String sql = "INSERT OR IGNORE INTO emage_placed_frames (frame_uuid, sync_group_id, world_uuid, chunk_x, chunk_z) VALUES (?, ?, ?, ?, ?)";
-        try (Connection conn = dbManager.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
-            for (ItemFrame frame : frames) {
-                ps.setString(1, frame.getUniqueId().toString());
-                ps.setInt(2, syncGroupId);
-                ps.setString(3, frame.getWorld().getUID().toString());
-                ps.setInt(4, frame.getLocation().getChunk().getX());
-                ps.setInt(5, frame.getLocation().getChunk().getZ());
-                ps.addBatch();
+        executeWrite(() -> {
+            String sql = "INSERT OR IGNORE INTO emage_placed_frames (frame_uuid, sync_group_id, world_uuid, chunk_x, chunk_z) VALUES (?, ?, ?, ?, ?)";
+            try (Connection conn = dbManager.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+                for (ItemFrame frame : frames) {
+                    ps.setString(1, frame.getUniqueId().toString());
+                    ps.setInt(2, syncGroupId);
+                    ps.setString(3, frame.getWorld().getUID().toString());
+                    ps.setInt(4, frame.getLocation().getChunk().getX());
+                    ps.setInt(5, frame.getLocation().getChunk().getZ());
+                    ps.addBatch();
+                }
+                ps.executeBatch();
             }
-            ps.executeBatch();
-        }
+        });
     }
 
     public void addPlacedFrame(int syncGroupId, ItemFrame frame) throws SQLException {
@@ -38,22 +68,26 @@ public class MapMetadataRepository {
     }
 
     public void removePlacedFrames(List<ItemFrame> frames) throws SQLException {
-        String sql = "DELETE FROM emage_placed_frames WHERE frame_uuid = ?";
-        try (Connection conn = dbManager.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
-            for (ItemFrame frame : frames) {
-                ps.setString(1, frame.getUniqueId().toString());
-                ps.addBatch();
+        executeWrite(() -> {
+            String sql = "DELETE FROM emage_placed_frames WHERE frame_uuid = ?";
+            try (Connection conn = dbManager.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+                for (ItemFrame frame : frames) {
+                    ps.setString(1, frame.getUniqueId().toString());
+                    ps.addBatch();
+                }
+                ps.executeBatch();
             }
-            ps.executeBatch();
-        }
+        });
     }
 
     public void removePlacedFrameByUUID(UUID frameUuid) throws SQLException {
-        String sql = "DELETE FROM emage_placed_frames WHERE frame_uuid = ?";
-        try (Connection conn = dbManager.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, frameUuid.toString());
-            ps.executeUpdate();
-        }
+        executeWrite(() -> {
+            String sql = "DELETE FROM emage_placed_frames WHERE frame_uuid = ?";
+            try (Connection conn = dbManager.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, frameUuid.toString());
+                ps.executeUpdate();
+            }
+        });
     }
 
     public int countPlacedFrames(int syncGroupId) throws SQLException {
@@ -95,79 +129,92 @@ public class MapMetadataRepository {
     @NotNull
     public MapMetadata createSyncGroup(@NotNull UUID creatorUuid, @NotNull String sourceUrl,
                                        int columns, int rows, int totalFrames, int delayMs) throws SQLException {
-        String sql = "INSERT INTO emage_metadata (creator_uuid, source_url, columns, rows, total_frames, delay_ms) VALUES (?, ?, ?, ?, ?, ?)";
-        try (Connection conn = dbManager.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            ps.setString(1, creatorUuid.toString());
-            ps.setString(2, sourceUrl);
-            ps.setInt(3, columns);
-            ps.setInt(4, rows);
-            ps.setInt(5, totalFrames);
-            ps.setInt(6, delayMs);
-            ps.executeUpdate();
-            try (ResultSet rs = ps.getGeneratedKeys()) {
-                if (rs.next()) return new MapMetadata(rs.getInt(1), creatorUuid, sourceUrl, columns, rows, totalFrames, delayMs);
-                else throw new SQLException("Failed to retrieve auto-generated sync_group_id from SQLite.");
-            }
+        try {
+            return dbWriteExecutor.submit(() -> {
+                String sql = "INSERT INTO emage_metadata (creator_uuid, source_url, columns, rows, total_frames, delay_ms) VALUES (?, ?, ?, ?, ?, ?)";
+                try (Connection conn = dbManager.getConnection();
+                     PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+                    ps.setString(1, creatorUuid.toString());
+                    ps.setString(2, sourceUrl);
+                    ps.setInt(3, columns);
+                    ps.setInt(4, rows);
+                    ps.setInt(5, totalFrames);
+                    ps.setInt(6, delayMs);
+                    ps.executeUpdate();
+                    try (ResultSet rs = ps.getGeneratedKeys()) {
+                        if (rs.next()) return new MapMetadata(rs.getInt(1), creatorUuid, sourceUrl, columns, rows, totalFrames, delayMs);
+                        else throw new SQLException("Failed to retrieve auto-generated sync_group_id from SQLite.");
+                    }
+                }
+            }).get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new SQLException("Thread interrupted during sync group creation", e);
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof SQLException sqlEx) throw sqlEx;
+            throw new SQLException("Failed to create sync group", e.getCause());
         }
     }
 
     @NotNull
     public List<Integer> allocateVirtualMapIds(int syncGroupId, int amount) throws SQLException {
-        List<Integer> allocatedIds = new ArrayList<>(amount);
-        Connection conn = null;
-        boolean initialAutoCommit = true;
         try {
-            conn = dbManager.getConnection();
-            initialAutoCommit = conn.getAutoCommit();
-            conn.setAutoCommit(false);
+            return dbWriteExecutor.submit(() -> {
+                List<Integer> allocatedIds = new ArrayList<>(amount);
+                Connection conn = null;
+                boolean initialAutoCommit = true;
+                try {
+                    conn = dbManager.getConnection();
+                    initialAutoCommit = conn.getAutoCommit();
+                    conn.setAutoCommit(false);
 
-            int firstId;
-            String sqlFirst = "INSERT INTO emage_maps (sync_group_id) VALUES (?)";
-            try (PreparedStatement ps = conn.prepareStatement(sqlFirst, Statement.RETURN_GENERATED_KEYS)) {
-                ps.setInt(1, syncGroupId);
-                ps.executeUpdate();
-                try (ResultSet rs = ps.getGeneratedKeys()) {
-                    if (rs.next()) {
-                        firstId = rs.getInt(1);
-                    } else {
-                        throw new SQLException("Failed to retrieve auto-generated map ID from SQLite.");
+                    StringBuilder sql = new StringBuilder("INSERT INTO emage_maps (sync_group_id) VALUES ");
+                    for (int i = 0; i < amount; i++) {
+                        if (i > 0) sql.append(", ");
+                        sql.append("(?)");
+                    }
+
+                    try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+                        for (int i = 1; i <= amount; i++) {
+                            ps.setInt(i, syncGroupId);
+                        }
+                        ps.executeUpdate();
+                    }
+
+                    int lastId = -1;
+                    try (Statement stmt = conn.createStatement(); ResultSet rs = stmt.executeQuery("SELECT last_insert_rowid()")) {
+                        if (rs.next()) {
+                            lastId = rs.getInt(1);
+                        }
+                    }
+
+                    if (lastId != -1) {
+                        int firstId = lastId - amount + 1;
+                        for (int i = 0; i < amount; i++) {
+                            allocatedIds.add(firstId + i);
+                        }
+                    }
+
+                    conn.commit();
+                } catch (SQLException e) {
+                    if (conn != null) try { conn.rollback(); } catch (SQLException ex) { e.addSuppressed(ex); }
+                    throw e;
+                } finally {
+                    if (conn != null) {
+                        try { conn.setAutoCommit(initialAutoCommit); } catch (SQLException ignored) {}
+                        try { conn.close(); } catch (SQLException ignored) {}
                     }
                 }
-            }
-            allocatedIds.add(firstId);
-
-            if (amount > 1) {
-                StringBuilder sqlRest = new StringBuilder("INSERT INTO emage_maps (sync_group_id) VALUES ");
-                for (int i = 1; i < amount; i++) {
-                    if (i > 1) sqlRest.append(", ");
-                    sqlRest.append("(?)");
-                }
-
-                try (PreparedStatement ps = conn.prepareStatement(sqlRest.toString())) {
-                    for (int i = 1; i < amount; i++) {
-                        ps.setInt(i, syncGroupId);
-                    }
-                    ps.executeUpdate();
-                }
-
-                for (int i = 1; i < amount; i++) {
-                    allocatedIds.add(firstId + i);
-                }
-            }
-
-            conn.commit();
-        } catch (SQLException e) {
-            if (conn != null) try { conn.rollback(); } catch (SQLException ex) { e.addSuppressed(ex); }
-            throw e;
-        } finally {
-            if (conn != null) {
-                try { conn.setAutoCommit(initialAutoCommit); } catch (SQLException ignored) {}
-                try { conn.close(); } catch (SQLException ignored) {}
-            }
+                if (allocatedIds.size() != amount) throw new SQLException("Failed to retrieve all auto-generated map IDs.");
+                return allocatedIds;
+            }).get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new SQLException("Thread interrupted during map ID allocation", e);
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof SQLException sqlEx) throw sqlEx;
+            throw new SQLException("Failed to allocate map IDs", e.getCause());
         }
-        if (allocatedIds.size() != amount) throw new SQLException("Failed to retrieve all auto-generated map IDs.");
-        return allocatedIds;
     }
 
     @NotNull
@@ -199,20 +246,30 @@ public class MapMetadataRepository {
     @NotNull
     public MapMetadata createSyncGroup(@NotNull UUID creatorUuid, @NotNull String sourceUrl, @NotNull String fileHash,
                                        int columns, int rows, int totalFrames, int delayMs) throws SQLException {
-        String sql = "INSERT INTO emage_metadata (creator_uuid, source_url, file_hash, columns, rows, total_frames, delay_ms) VALUES (?, ?, ?, ?, ?, ?, ?)";
-        try (Connection conn = dbManager.getConnection(); PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-            ps.setString(1, creatorUuid.toString());
-            ps.setString(2, sourceUrl);
-            ps.setString(3, fileHash);
-            ps.setInt(4, columns);
-            ps.setInt(5, rows);
-            ps.setInt(6, totalFrames);
-            ps.setInt(7, delayMs);
-            ps.executeUpdate();
-            try (ResultSet rs = ps.getGeneratedKeys()) {
-                if (rs.next()) return new MapMetadata(rs.getInt(1), creatorUuid, sourceUrl, columns, rows, totalFrames, delayMs);
-                else throw new SQLException("Failed to retrieve auto-generated ID.");
-            }
+        try {
+            return dbWriteExecutor.submit(() -> {
+                String sql = "INSERT INTO emage_metadata (creator_uuid, source_url, file_hash, columns, rows, total_frames, delay_ms) VALUES (?, ?, ?, ?, ?, ?, ?)";
+                try (Connection conn = dbManager.getConnection(); PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+                    ps.setString(1, creatorUuid.toString());
+                    ps.setString(2, sourceUrl);
+                    ps.setString(3, fileHash);
+                    ps.setInt(4, columns);
+                    ps.setInt(5, rows);
+                    ps.setInt(6, totalFrames);
+                    ps.setInt(7, delayMs);
+                    ps.executeUpdate();
+                    try (ResultSet rs = ps.getGeneratedKeys()) {
+                        if (rs.next()) return new MapMetadata(rs.getInt(1), creatorUuid, sourceUrl, columns, rows, totalFrames, delayMs);
+                        else throw new SQLException("Failed to retrieve auto-generated ID.");
+                    }
+                }
+            }).get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new SQLException("Thread interrupted during sync group creation", e);
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof SQLException sqlEx) throw sqlEx;
+            throw new SQLException("Failed to create sync group", e.getCause());
         }
     }
 
@@ -266,10 +323,12 @@ public class MapMetadataRepository {
     }
 
     public void deleteSyncGroup(int syncGroupId) throws SQLException {
-        String sql = "DELETE FROM emage_metadata WHERE sync_group_id = ?";
-        try (Connection conn = dbManager.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setInt(1, syncGroupId);
-            ps.executeUpdate();
-        }
+        executeWrite(() -> {
+            String sql = "DELETE FROM emage_metadata WHERE sync_group_id = ?";
+            try (Connection conn = dbManager.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setInt(1, syncGroupId);
+                ps.executeUpdate();
+            }
+        });
     }
 }

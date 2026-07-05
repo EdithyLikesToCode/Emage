@@ -1,11 +1,12 @@
 package net.ed1thy.emage.processing;
 
-import java.awt.image.BufferedImage;
-
 public interface ImageFrameProvider extends AutoCloseable {
     int getFrameCount();
     int getDelayMs();
-    BufferedImage getFrame(int index);
+    int getFrameDelayMs(int index);
+    int[] getFramePixels(int index);
+    int getFrameWidth(int index);
+    int getFrameHeight(int index);
 
     @Override
     void close() throws Exception;

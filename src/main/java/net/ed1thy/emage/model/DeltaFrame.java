@@ -8,9 +8,15 @@ public record DeltaFrame(
         int mapId,
         @NotNull ByteBuf packetBuf
 ) {
+    public void retain() {
+        if (packetBuf != null && packetBuf.refCnt() > 0) {
+            packetBuf.retain();
+        }
+    }
+
     public void freeMemory() {
         if (packetBuf != null && packetBuf.refCnt() > 0) {
-            packetBuf.release(packetBuf.refCnt());
+            packetBuf.release();
         }
     }
 }

@@ -24,6 +24,7 @@ import org.jetbrains.annotations.NotNull;
 
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
 
 public class PersistenceListener implements Listener {
 
@@ -34,11 +35,12 @@ public class PersistenceListener implements Listener {
     private final ChunkTrackerListener chunkTrackerListener;
     private final ConfigManager configManager;
     private final FlatFileStorage flatFileStorage;
+    private final ExecutorService vtExecutor;
 
     public PersistenceListener(@NotNull Emage plugin, @NotNull FrameInteractListener interactListener,
                                @NotNull MapMetadataRepository repository, @NotNull RenderManager renderManager,
                                @NotNull ChunkTrackerListener chunkTrackerListener, @NotNull ConfigManager configManager,
-                               @NotNull FlatFileStorage flatFileStorage) {
+                               @NotNull FlatFileStorage flatFileStorage, @NotNull ExecutorService vtExecutor) {
         this.plugin = plugin;
         this.interactListener = interactListener;
         this.repository = repository;
@@ -46,18 +48,23 @@ public class PersistenceListener implements Listener {
         this.chunkTrackerListener = chunkTrackerListener;
         this.configManager = configManager;
         this.flatFileStorage = flatFileStorage;
+        this.vtExecutor = vtExecutor;
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onEntitiesLoad(EntitiesLoadEvent event) {
         List<ItemFrame> loadedFrames = new ArrayList<>();
         List<FrameNode> createdNodes = new ArrayList<>();
+        List<Integer> loadedMapIds = new ArrayList<>();
 
         for (Entity entity : event.getEntities()) {
             if (entity instanceof ItemFrame frame) {
                 if (frame.getPersistentDataContainer().has(interactListener.getEmageKey(), PersistentDataType.INTEGER)) {
+                    Integer mapId = frame.getPersistentDataContainer().get(interactListener.getEmageKey(), PersistentDataType.INTEGER);
+                    if (mapId == null) continue;
+
                     loadedFrames.add(frame);
-                    int mapId = frame.getPersistentDataContainer().get(interactListener.getEmageKey(), PersistentDataType.INTEGER);
+                    loadedMapIds.add(mapId);
 
                     ItemStack bukkitMap = new ItemStack(Material.FILLED_MAP);
                     if (bukkitMap.getItemMeta() instanceof MapMeta mapMeta) {
@@ -76,6 +83,8 @@ public class PersistenceListener implements Listener {
             }
         }
 
+        if (loadedFrames.isEmpty()) return;
+
         UUID worldUuid = event.getChunk().getWorld().getUID();
         int cx = event.getChunk().getX();
         int cz = event.getChunk().getZ();
@@ -85,11 +94,12 @@ public class PersistenceListener implements Listener {
                 List<UUID> dbExpected = repository.getPlacedFramesInChunk(worldUuid, cx, cz);
                 Set<UUID> actualEmageFrames = new HashSet<>();
 
-                for (ItemFrame frame : loadedFrames) {
+                for (int i = 0; i < loadedFrames.size(); i++) {
+                    ItemFrame frame = loadedFrames.get(i);
                     actualEmageFrames.add(frame.getUniqueId());
 
                     if (!dbExpected.contains(frame.getUniqueId())) {
-                        int mapId = frame.getPersistentDataContainer().get(interactListener.getEmageKey(), PersistentDataType.INTEGER);
+                        int mapId = loadedMapIds.get(i);
                         Optional<MapMetadata> metaOpt = repository.getMetadataByMapId(mapId);
                         metaOpt.ifPresent(meta -> {
                             try { repository.addPlacedFrame(meta.syncGroupID(), frame); } catch (Exception ignored) {}
@@ -113,7 +123,7 @@ public class PersistenceListener implements Listener {
                 for (int i = 0; i < loadedFrames.size(); i++) {
                     ItemFrame frame = loadedFrames.get(i);
                     FrameNode node = createdNodes.get(i);
-                    int mapId = frame.getPersistentDataContainer().get(interactListener.getEmageKey(), PersistentDataType.INTEGER);
+                    int mapId = node.getMapID();
 
                     Optional<MapMetadata> metaOpt = repository.getMetadataByMapId(mapId);
 
@@ -123,7 +133,7 @@ public class PersistenceListener implements Listener {
                             SyncGroup group = renderManager.getSyncGroup(meta.syncGroupID());
 
                             if (group == null) {
-                                group = new SyncGroup(meta, new CopyOnWriteArrayList<>(Collections.singletonList(node)), flatFileStorage, configManager, null);
+                                group = new SyncGroup(meta, new CopyOnWriteArrayList<>(Collections.singletonList(node)), flatFileStorage, renderManager.getGlobalFrameCache(), vtExecutor, null);
                                 renderManager.registerSyncGroup(meta.syncGroupID(), group);
                             } else {
                                 boolean exists = false;

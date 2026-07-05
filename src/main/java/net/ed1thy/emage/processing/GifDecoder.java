@@ -1,6 +1,5 @@
 package net.ed1thy.emage.processing;
 
-import java.awt.image.BufferedImage;
 import java.util.ArrayList;
 
 public class GifDecoder implements ImageFrameProvider {
@@ -37,10 +36,10 @@ public class GifDecoder implements ImageFrameProvider {
     private final ArrayList<GifFrame> frames = new ArrayList<>();
 
     private static class GifFrame {
-        public BufferedImage image;
+        public int[] pixels;
         public int delay;
-        public GifFrame(BufferedImage im, int del) {
-            image = im;
+        public GifFrame(int[] px, int del) {
+            pixels = px;
             delay = del;
         }
     }
@@ -57,7 +56,14 @@ public class GifDecoder implements ImageFrameProvider {
 
     @Override public int getFrameCount() { return frames.size(); }
     @Override public int getDelayMs() { return frames.isEmpty() ? 100 : frames.get(0).delay; }
-    @Override public BufferedImage getFrame(int n) { return frames.get(n).image; }
+    @Override public int getFrameDelayMs(int index) {
+        if (index < 0 || index >= frames.size()) return 100;
+        int d = frames.get(index).delay;
+        return d <= 0 ? 100 : d;
+    }
+    @Override public int getFrameWidth(int index) { return width; }
+    @Override public int getFrameHeight(int index) { return height; }
+    @Override public int[] getFramePixels(int n) { return frames.get(n).pixels; }
     @Override public void close() throws Exception {}
 
     private boolean err() { return p >= in.length; }
@@ -165,9 +171,9 @@ public class GifDecoder implements ImageFrameProvider {
         skip();
         setPixels();
 
-        BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
-        image.setRGB(0, 0, width, height, mainPixels, 0, width);
-        frames.add(new GifFrame(image, delay));
+        int[] framePixels = new int[width * height];
+        System.arraycopy(mainPixels, 0, framePixels, 0, width * height);
+        frames.add(new GifFrame(framePixels, delay));
 
         if (transparency) act[transIndex] = save;
 

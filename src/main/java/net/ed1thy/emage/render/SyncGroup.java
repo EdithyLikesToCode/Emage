@@ -1,13 +1,16 @@
 package net.ed1thy.emage.render;
 
 import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
-import net.ed1thy.emage.config.ConfigManager;
 import net.ed1thy.emage.model.DeltaFrame;
 import net.ed1thy.emage.model.FrameNode;
 import net.ed1thy.emage.model.MapFrameUpdate;
 import net.ed1thy.emage.model.MapMetadata;
 import net.ed1thy.emage.storage.FlatFileStorage;
+import org.bukkit.Bukkit;
+import org.bukkit.Location;
+import org.bukkit.World;
+import org.bukkit.entity.Player;
+import org.bukkit.util.Vector;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -20,69 +23,70 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 
 public class SyncGroup {
 
     private final MapMetadata metadata;
     private final List<FrameNode> nodes;
     private final FlatFileStorage flatFileStorage;
+    private final Cache<Long, MapFrameUpdate> frameCache;
+    private final ExecutorService vtExecutor;
 
     private int currentFrameIndex = 0;
     private long lastTickTime = 0;
 
-    private final Cache<Long, MapFrameUpdate> frameCache;
     private final Map<Integer, MapFrameUpdate> baseFrames = new ConcurrentHashMap<>();
-    private final Map<Integer, Long> failedFrameIndices = new ConcurrentHashMap<>();
+    private final Set<Integer> loadingFrames = ConcurrentHashMap.newKeySet();
 
     private final Set<UUID> initializedUsers = ConcurrentHashMap.newKeySet();
     private final Set<UUID> visiblePlayers = ConcurrentHashMap.newKeySet();
 
-    private final List<org.bukkit.util.Vector> checkPoints = new CopyOnWriteArrayList<>();
-    private final List<org.bukkit.Location> centerLocs = new CopyOnWriteArrayList<>();
-    private org.bukkit.World world;
+    private final Set<UUID> pendingVisibilityChecks = ConcurrentHashMap.newKeySet();
 
-    private static final ExecutorService vtExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    private final List<Location> centerLocs = new CopyOnWriteArrayList<>();
+    private volatile World world;
+
+    private int[] frameDelays;
+
+    private volatile double minX, minY, minZ, maxX, maxY, maxZ;
 
     public SyncGroup(@NotNull MapMetadata metadata, @NotNull List<FrameNode> nodes,
-                     @NotNull FlatFileStorage flatFileStorage, @NotNull ConfigManager configManager,
-                     @Nullable Map<Long, MapFrameUpdate> preloadedFrames) {
+                     @NotNull FlatFileStorage flatFileStorage, @NotNull Cache<Long, MapFrameUpdate> frameCache,
+                     @NotNull ExecutorService vtExecutor, @Nullable Map<Integer, MapFrameUpdate> preloadedBaseFrames) {
         this.metadata = metadata;
         this.nodes = nodes;
         this.flatFileStorage = flatFileStorage;
+        this.frameCache = frameCache;
+        this.vtExecutor = vtExecutor;
 
-        long maxBytes = (long) configManager.cacheMaxMemoryMb * 1024L * 1024L;
-
-        this.frameCache = Caffeine.newBuilder()
-                .maximumWeight(maxBytes)
-                .weigher((Long key, MapFrameUpdate value) -> value.totalBytes())
-                .expireAfterAccess(configManager.cacheExpireMinutes, TimeUnit.MINUTES)
-                .removalListener((Long key, MapFrameUpdate value, com.github.benmanes.caffeine.cache.RemovalCause cause) -> {
-                    if (value != null) {
-                        value.freeMemory();
-                    }
-                })
-                .build();
-
-        if (preloadedFrames != null) {
-            for (FrameNode node : nodes) {
-                int mapId = node.getMapID();
-                long key = (0L << 32) | (mapId & 0xFFFFFFFFL);
-                MapFrameUpdate f0 = preloadedFrames.get(key);
-                if (f0 != null) baseFrames.put(mapId, f0);
+        if (preloadedBaseFrames != null) {
+            baseFrames.putAll(preloadedBaseFrames);
+            for (Map.Entry<Integer, MapFrameUpdate> entry : preloadedBaseFrames.entrySet()) {
+                long key = (0L << 32) | (entry.getKey() & 0xFFFFFFFFL);
+                frameCache.put(key, entry.getValue());
             }
-        } else {
-            CompletableFuture.runAsync(() -> {
-                try {
+        }
+
+        CompletableFuture.runAsync(() -> {
+            try {
+                if (preloadedBaseFrames == null) {
                     Map<Integer, MapFrameUpdate> f0Bundle = flatFileStorage.loadBundledFrame(metadata.syncGroupID(), 0);
                     baseFrames.putAll(f0Bundle);
-                } catch (Exception ignored) {}
-            }, vtExecutor);
+                }
+
+                frameDelays = flatFileStorage.loadFrameDelays(metadata.syncGroupID());
+                if (frameDelays == null || frameDelays.length == 0) {
+                    frameDelays = new int[] { metadata.delayMs() };
+                }
+            } catch (Exception ignored) {}
+        }, vtExecutor);
+
+        if (frameDelays == null) {
+            frameDelays = new int[] { metadata.delayMs() };
         }
 
         if (!nodes.isEmpty()) {
-            this.world = org.bukkit.Bukkit.getWorld(nodes.get(0).getWorldUUID());
+            this.world = Bukkit.getWorld(nodes.get(0).getWorldUUID());
             addNewWallBounds(nodes);
         }
     }
@@ -90,7 +94,7 @@ public class SyncGroup {
     public void addNewWall(List<FrameNode> newNodes) {
         this.nodes.addAll(newNodes);
         if (this.world == null && !newNodes.isEmpty()) {
-            this.world = org.bukkit.Bukkit.getWorld(newNodes.get(0).getWorldUUID());
+            this.world = Bukkit.getWorld(newNodes.get(0).getWorldUUID());
         }
         addNewWallBounds(newNodes);
     }
@@ -98,91 +102,101 @@ public class SyncGroup {
     private void addNewWallBounds(List<FrameNode> wallNodes) {
         if (wallNodes.isEmpty() || this.world == null) return;
 
-        double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE, minZ = Double.MAX_VALUE;
-        double maxX = -Double.MAX_VALUE, maxY = -Double.MAX_VALUE, maxZ = -Double.MAX_VALUE;
+        double cMinX = Double.MAX_VALUE, cMinY = Double.MAX_VALUE, cMinZ = Double.MAX_VALUE;
+        double cMaxX = -Double.MAX_VALUE, cMaxY = -Double.MAX_VALUE, cMaxZ = -Double.MAX_VALUE;
 
         for (FrameNode n : wallNodes) {
-            minX = Math.min(minX, n.getBlockX()); minY = Math.min(minY, n.getBlockY()); minZ = Math.min(minZ, n.getBlockZ());
-            maxX = Math.max(maxX, n.getBlockX() + 1.0); maxY = Math.max(maxY, n.getBlockY() + 1.0); maxZ = Math.max(maxZ, n.getBlockZ() + 1.0);
+            cMinX = Math.min(cMinX, n.getBlockX()); cMinY = Math.min(cMinY, n.getBlockY()); cMinZ = Math.min(cMinZ, n.getBlockZ());
+            cMaxX = Math.max(cMaxX, n.getBlockX() + 1.0); cMaxY = Math.max(cMaxY, n.getBlockY() + 1.0); cMaxZ = Math.max(cMaxZ, n.getBlockZ() + 1.0);
         }
 
-        org.bukkit.Location center = new org.bukkit.Location(world, (minX + maxX) / 2.0, (minY + maxY) / 2.0, (minZ + maxZ) / 2.0);
+        if (centerLocs.isEmpty()) {
+            this.minX = cMinX; this.minY = cMinY; this.minZ = cMinZ;
+            this.maxX = cMaxX; this.maxY = cMaxY; this.maxZ = cMaxZ;
+        } else {
+            this.minX = Math.min(this.minX, cMinX); this.minY = Math.min(this.minY, cMinY); this.minZ = Math.min(this.minZ, cMinZ);
+            this.maxX = Math.max(this.maxX, cMaxX); this.maxY = Math.max(this.maxY, cMaxY); this.maxZ = Math.max(this.maxZ, cMaxZ);
+        }
+
+        Location center = new Location(world, (cMinX + cMaxX) / 2.0, (cMinY + cMaxY) / 2.0, (cMinZ + cMaxZ) / 2.0);
         this.centerLocs.add(center);
-
-        this.checkPoints.add(center.toVector());
-
-        this.checkPoints.add(new org.bukkit.util.Vector(minX, minY, minZ));
-        this.checkPoints.add(new org.bukkit.util.Vector(maxX, minY, minZ));
-        this.checkPoints.add(new org.bukkit.util.Vector(minX, maxY, minZ));
-        this.checkPoints.add(new org.bukkit.util.Vector(maxX, maxY, minZ));
-        this.checkPoints.add(new org.bukkit.util.Vector(minX, minY, maxZ));
-        this.checkPoints.add(new org.bukkit.util.Vector(maxX, minY, maxZ));
-        this.checkPoints.add(new org.bukkit.util.Vector(minX, maxY, maxZ));
-        this.checkPoints.add(new org.bukkit.util.Vector(maxX, maxY, maxZ));
     }
 
     public void updateVisibility() {
         if (world == null || centerLocs.isEmpty()) return;
-        visiblePlayers.clear();
 
-        for (org.bukkit.entity.Player player : world.getPlayers()) {
-            if (visiblePlayers.contains(player.getUniqueId())) continue;
+        for (Player player : world.getPlayers()) {
+            Location pLoc = player.getLocation();
+            if (pLoc.getX() < minX - 32 || pLoc.getX() > maxX + 32 ||
+                    pLoc.getY() < minY - 32 || pLoc.getY() > maxY + 32 ||
+                    pLoc.getZ() < minZ - 32 || pLoc.getZ() > maxZ + 32) {
+                continue;
+            }
+
+            UUID uuid = player.getUniqueId();
+            if (pendingVisibilityChecks.contains(uuid)) continue;
 
             boolean inRange = false;
-            for (org.bukkit.Location center : centerLocs) {
-                if (center.distanceSquared(player.getLocation()) <= 1024.0) {
+            for (Location center : centerLocs) {
+                if (center.distanceSquared(pLoc) <= 1024.0) {
                     inRange = true;
                     break;
                 }
             }
             if (!inRange) continue;
 
-            if (isVisible(player)) {
-                visiblePlayers.add(player.getUniqueId());
-            }
+            Location eyeLoc = player.getEyeLocation().clone();
+            Vector lookDir = eyeLoc.getDirection().clone();
+
+            pendingVisibilityChecks.add(uuid);
+
+            CompletableFuture.runAsync(() -> {
+                boolean canSee = calculateVisibilityAsync(eyeLoc, lookDir);
+
+                if (canSee) {
+                    visiblePlayers.add(uuid);
+                } else {
+                    visiblePlayers.remove(uuid);
+                    initializedUsers.remove(uuid);
+                }
+
+                pendingVisibilityChecks.remove(uuid);
+            }, vtExecutor);
         }
 
-        initializedUsers.removeIf(uuid -> !visiblePlayers.contains(uuid));
+        initializedUsers.removeIf(uuid -> !visiblePlayers.contains(uuid) && Bukkit.getPlayer(uuid) == null);
     }
 
-    private boolean isVisible(org.bukkit.entity.Player player) {
-        org.bukkit.Location eyeLoc = player.getEyeLocation();
-        org.bukkit.util.Vector eye = eyeLoc.toVector();
-        org.bukkit.util.Vector lookDir = eyeLoc.getDirection();
+    private boolean calculateVisibilityAsync(Location eyeLoc, Vector lookDir) {
+        Vector eye = eyeLoc.toVector();
 
-        double lookX = lookDir.getX();
-        double lookY = lookDir.getY();
-        double lookZ = lookDir.getZ();
-        double eyeX = eye.getX();
-        double eyeY = eye.getY();
-        double eyeZ = eye.getZ();
+        Vector[] corners = new Vector[] {
+                new Vector(minX, minY, minZ),
+                new Vector(maxX, minY, minZ),
+                new Vector(minX, maxY, minZ),
+                new Vector(maxX, maxY, minZ),
+                new Vector(minX, minY, maxZ),
+                new Vector(maxX, minY, maxZ),
+                new Vector(minX, maxY, maxZ),
+                new Vector(maxX, maxY, maxZ)
+        };
 
-        for (org.bukkit.util.Vector pt : checkPoints) {
-            double dx = pt.getX() - eyeX;
-            double dy = pt.getY() - eyeY;
-            double dz = pt.getZ() - eyeZ;
+        for (Vector corner : corners) {
+            Vector toCorner = corner.clone().subtract(eye);
+            double distSq = toCorner.lengthSquared();
 
-            double distSq = dx * dx + dy * dy + dz * dz;
+            if (distSq < 9.0) return true;
+
             if (distSq > 1024.0) continue;
 
-            double dist = Math.sqrt(distSq);
-            double dot = (dx * lookX + dy * lookY + dz * lookZ) / dist;
+            toCorner.normalize();
+            double dot = toCorner.dot(lookDir);
 
             if (dot > 0.0) {
-                org.bukkit.util.Vector dirToPt = new org.bukkit.util.Vector(dx / dist, dy / dist, dz / dist);
-                try {
-                    org.bukkit.util.RayTraceResult hit = world.rayTraceBlocks(eyeLoc, dirToPt, dist, org.bukkit.FluidCollisionMode.NEVER, true);
-                    if (hit == null || hit.getHitBlock() == null) {
-                        return true;
-                    } else {
-                        double hitDist = hit.getHitPosition().distance(eye);
-                        if (hitDist >= dist - 0.8) {
-                            return true;
-                        }
-                    }
-                } catch (Exception ignored) {}
+                return true;
             }
         }
+
         return false;
     }
 
@@ -190,49 +204,13 @@ public class SyncGroup {
         if (!metadata.isAnimated()) {
             return (currentTimeMillis - lastTickTime) >= 1000;
         }
-        return (currentTimeMillis - lastTickTime) >= metadata.delayMs();
+        int delay = (frameDelays != null && currentFrameIndex < frameDelays.length) ? frameDelays[currentFrameIndex] : metadata.delayMs();
+        if (delay <= 0) delay = metadata.delayMs();
+        return (currentTimeMillis - lastTickTime) >= delay;
     }
 
     public void tick(long currentTimeMillis, @NotNull ChunkViewerTracker tracker, @NotNull RenderManager renderManager, @NotNull PacketSender sender) {
-        lastTickTime = currentTimeMillis;
-
-        if (metadata.isAnimated()) {
-            currentFrameIndex++;
-            if (currentFrameIndex >= metadata.totalFrames()) {
-                currentFrameIndex = 0;
-            }
-        } else {
-            currentFrameIndex = 0;
-        }
-
         if (visiblePlayers.isEmpty()) return;
-
-        if (metadata.isAnimated()) {
-            int nextFrame = (currentFrameIndex + 1) % metadata.totalFrames();
-            boolean missingNext = false;
-            for (FrameNode node : nodes) {
-                if (frameCache.getIfPresent(((long) nextFrame << 32) | (node.getMapID() & 0xFFFFFFFFL)) == null) {
-                    missingNext = true; break;
-                }
-            }
-
-            Long retryAt = failedFrameIndices.get(nextFrame);
-            if (missingNext && (retryAt == null || currentTimeMillis >= retryAt)) {
-                CompletableFuture.runAsync(() -> {
-                    try {
-                        Map<Integer, MapFrameUpdate> bundled = flatFileStorage.loadBundledFrame(metadata.syncGroupID(), nextFrame);
-                        for (FrameNode node : nodes) {
-                            long key = ((long) nextFrame << 32) | (node.getMapID() & 0xFFFFFFFFL);
-                            MapFrameUpdate update = bundled.get(node.getMapID());
-                            frameCache.put(key, update != null ? update : new MapFrameUpdate(new DeltaFrame[0]));
-                        }
-                        failedFrameIndices.remove(nextFrame);
-                    } catch (Exception e) {
-                        failedFrameIndices.put(nextFrame, System.currentTimeMillis() + 30000L);
-                    }
-                }, vtExecutor);
-            }
-        }
 
         boolean missingCurrent = false;
         for (FrameNode node : nodes) {
@@ -241,19 +219,25 @@ public class SyncGroup {
             }
         }
 
-        Long retryAtCurrent = failedFrameIndices.get(currentFrameIndex);
-        if (missingCurrent && (retryAtCurrent == null || currentTimeMillis >= retryAtCurrent)) {
-            try {
-                Map<Integer, MapFrameUpdate> bundled = flatFileStorage.loadBundledFrame(metadata.syncGroupID(), currentFrameIndex);
-                for (FrameNode node : nodes) {
-                    long key = ((long) currentFrameIndex << 32) | (node.getMapID() & 0xFFFFFFFFL);
-                    MapFrameUpdate update = bundled.get(node.getMapID());
-                    frameCache.put(key, update != null ? update : new MapFrameUpdate(new DeltaFrame[0]));
-                }
-                failedFrameIndices.remove(currentFrameIndex);
-            } catch (Exception e) {
-                failedFrameIndices.put(currentFrameIndex, currentTimeMillis + 30000L);
+        if (missingCurrent) {
+            if (!loadingFrames.contains(currentFrameIndex)) {
+                loadingFrames.add(currentFrameIndex);
+                final int cFrame = currentFrameIndex;
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        Map<Integer, MapFrameUpdate> bundled = flatFileStorage.loadBundledFrame(metadata.syncGroupID(), cFrame);
+                        for (FrameNode node : nodes) {
+                            long key = ((long) cFrame << 32) | (node.getMapID() & 0xFFFFFFFFL);
+                            MapFrameUpdate update = bundled.get(node.getMapID());
+                            frameCache.put(key, update != null ? update : new MapFrameUpdate(new DeltaFrame[0]));
+                        }
+                    } catch (Exception ignored) {
+                    } finally {
+                        loadingFrames.remove(cFrame);
+                    }
+                }, vtExecutor);
             }
+            return;
         }
 
         Set<UUID> newlyInitialized = new HashSet<>();
@@ -275,8 +259,10 @@ public class SyncGroup {
                         }
                     }
 
-                    for (DeltaFrame subChunk : update.parts()) {
-                        renderManager.enqueuePacket(uuid, sender.createMapPacket(subChunk));
+                    if (isNewUser || metadata.isAnimated()) {
+                        for (DeltaFrame subChunk : update.parts()) {
+                            renderManager.enqueuePacket(uuid, sender.createMapPacket(subChunk));
+                        }
                     }
                     newlyInitialized.add(uuid);
                 }
@@ -284,6 +270,43 @@ public class SyncGroup {
         }
 
         initializedUsers.addAll(newlyInitialized);
+
+        lastTickTime = currentTimeMillis;
+
+        if (metadata.isAnimated()) {
+            currentFrameIndex++;
+            if (currentFrameIndex >= metadata.totalFrames()) {
+                currentFrameIndex = 0;
+            }
+
+            int nextFrame = currentFrameIndex;
+            boolean missingNext = false;
+            for (FrameNode node : nodes) {
+                if (frameCache.getIfPresent(((long) nextFrame << 32) | (node.getMapID() & 0xFFFFFFFFL)) == null) {
+                    missingNext = true; break;
+                }
+            }
+
+            if (missingNext && !loadingFrames.contains(nextFrame)) {
+                loadingFrames.add(nextFrame);
+                final int nxtFrame = nextFrame;
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        Map<Integer, MapFrameUpdate> bundled = flatFileStorage.loadBundledFrame(metadata.syncGroupID(), nxtFrame);
+                        for (FrameNode node : nodes) {
+                            long key = ((long) nxtFrame << 32) | (node.getMapID() & 0xFFFFFFFFL);
+                            MapFrameUpdate update = bundled.get(node.getMapID());
+                            frameCache.put(key, update != null ? update : new MapFrameUpdate(new DeltaFrame[0]));
+                        }
+                    } catch (Exception ignored) {
+                    } finally {
+                        loadingFrames.remove(nxtFrame);
+                    }
+                }, vtExecutor);
+            }
+        } else {
+            currentFrameIndex = 0;
+        }
     }
 
     public List<FrameNode> getNodes() {
@@ -296,7 +319,11 @@ public class SyncGroup {
         }
         baseFrames.clear();
 
-        frameCache.invalidateAll();
-        frameCache.cleanUp();
+        for (FrameNode node : nodes) {
+            for (int i = 0; i < metadata.totalFrames(); i++) {
+                long key = ((long) i << 32) | (node.getMapID() & 0xFFFFFFFFL);
+                frameCache.invalidate(key);
+            }
+        }
     }
 }

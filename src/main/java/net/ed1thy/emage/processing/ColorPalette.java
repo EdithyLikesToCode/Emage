@@ -1,5 +1,8 @@
 package net.ed1thy.emage.processing;
 
+import org.jetbrains.annotations.NotNull;
+
+import java.io.InputStream;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ForkJoinPool;
@@ -12,7 +15,7 @@ public class ColorPalette {
     private final double[][] mcColorsOklab = new double[256][3];
     private volatile boolean isReady = false;
 
-    private final ForkJoinPool customPool = new ForkJoinPool(Math.max(1, Runtime.getRuntime().availableProcessors() - 1));
+    private final ForkJoinPool customPool;
 
     private static final int[] BASE_COLORS = {
             0x000000, 0x7FB238, 0xF7E9A3, 0xC7C7C7, 0xFF0000, 0xA0A0FF, 0xA7A7A7, 0x007C00,
@@ -25,8 +28,23 @@ public class ColorPalette {
             0x3A8E8C, 0x562C3E, 0x14B485, 0x646464, 0xD8AF93, 0x7FAEA6
     };
 
+    public ColorPalette(@NotNull ForkJoinPool computePool) {
+        this.customPool = computePool;
+    }
+
     public CompletableFuture<Void> generateLUT() {
         return CompletableFuture.runAsync(() -> {
+            try (InputStream is = ColorPalette.class.getResourceAsStream("/emage_lut.bin")) {
+                if (is != null) {
+                    byte[] bytes = is.readAllBytes();
+                    if (bytes.length == colorMap.length) {
+                        System.arraycopy(bytes, 0, colorMap, 0, colorMap.length);
+                        isReady = true;
+                        return;
+                    }
+                }
+            } catch (Exception ignored) {}
+
             try {
                 int maxId = 0;
                 for (int i = 0; i < BASE_COLORS.length; i++) {
@@ -131,7 +149,5 @@ public class ColorPalette {
         return isReady;
     }
 
-    public void shutdown() {
-        customPool.shutdown();
-    }
+    public void shutdown() {}
 }

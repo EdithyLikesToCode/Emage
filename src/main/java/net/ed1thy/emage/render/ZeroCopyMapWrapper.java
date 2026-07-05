@@ -22,7 +22,10 @@ public class ZeroCopyMapWrapper extends PacketWrapper<ZeroCopyMapWrapper> {
     public void write() {
         ByteBuf nettyBuf = (ByteBuf) getBuffer();
         ByteBuf deltaBuf = delta.packetBuf();
-        nettyBuf.writeBytes(deltaBuf, deltaBuf.readerIndex(), deltaBuf.readableBytes());    }
+        nettyBuf.writeBytes(deltaBuf, deltaBuf.readerIndex(), deltaBuf.readableBytes());
+
+        delta.freeMemory();
+    }
 
     @Override
     public void read() {}

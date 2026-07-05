@@ -14,30 +14,30 @@ import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ForkJoinPool;
 import java.util.function.Consumer;
 
 public class ImagePipeline {
 
     private final ColorPalette lut;
     private final FlatFileStorage storage;
-    private final BlueNoiseDither dither = new BlueNoiseDither();
-    private final ExecutorService vtExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    private final BlueNoiseDither dither;
+    private final ExecutorService vtExecutor;
 
-    public ImagePipeline(@NotNull ColorPalette lut, @NotNull FlatFileStorage storage) {
+    public ImagePipeline(@NotNull ColorPalette lut, @NotNull FlatFileStorage storage, @NotNull ExecutorService vtExecutor, @NotNull ForkJoinPool computePool) {
         this.lut = lut;
         this.storage = storage;
+        this.dither = new BlueNoiseDither(computePool);
+        this.vtExecutor = vtExecutor;
     }
 
-    public void shutdown() {
-        vtExecutor.shutdownNow();
-        dither.shutdown();
-    }
+    public void shutdown() {}
 
     private void writeVarInt(ByteBuf buf, int value) {
         while ((value & -128) != 0) {
@@ -47,12 +47,12 @@ public class ImagePipeline {
         buf.writeByte(value);
     }
 
-    public CompletableFuture<ConcurrentHashMap<Long, MapFrameUpdate>> processStreamAsync(
+    public CompletableFuture<Map<Integer, MapFrameUpdate>> processStreamAsync(
             @NotNull ImageFrameProvider decoder, int syncGroupId, @NotNull List<Integer> virtualMapIds, int columns, int rows,
             @Nullable Consumer<Double> progressCallback) {
 
         return CompletableFuture.supplyAsync(() -> {
-            ConcurrentHashMap<Long, MapFrameUpdate> preloadedMap = new ConcurrentHashMap<>();
+            Map<Integer, MapFrameUpdate> firstFrameMap = new HashMap<>();
             List<CompletableFuture<Void>> ioTasks = new ArrayList<>();
 
             try (decoder) {
@@ -62,119 +62,140 @@ public class ImagePipeline {
 
                 int totalWidth = columns * 128;
                 int totalHeight = rows * 128;
-                byte[][] previousMapFrames = new byte[virtualMapIds.size()][16384];
+
+                BufferedImage scaledImage = new BufferedImage(totalWidth, totalHeight, BufferedImage.TYPE_INT_ARGB);
+                Graphics2D gFinal = scaledImage.createGraphics();
+                gFinal.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                gFinal.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+                gFinal.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+                gFinal.setRenderingHint(RenderingHints.KEY_COLOR_RENDERING, RenderingHints.VALUE_COLOR_RENDER_QUALITY);
+                gFinal.setComposite(AlphaComposite.Src);
+
+                int[] argbPixels = new int[totalWidth * totalHeight];
+                byte[] ditheredColors = new byte[totalWidth * totalHeight];
+                BufferedImage rawImage = null;
+
+                byte[][] prevMapFrames = new byte[virtualMapIds.size()][];
+                byte[][] currMapFrames = new byte[virtualMapIds.size()][];
+                for (int i = 0; i < virtualMapIds.size(); i++) {
+                    prevMapFrames[i] = new byte[16384];
+                    currMapFrames[i] = new byte[16384];
+                }
 
                 int totalFramesCount = decoder.getFrameCount();
 
+                int[] frameDelays = new int[totalFramesCount];
+                for (int i = 0; i < totalFramesCount; i++) {
+                    frameDelays[i] = decoder.getFrameDelayMs(i);
+                }
+                ioTasks.add(storage.saveFrameDelaysAsync(syncGroupId, frameDelays));
+
                 for (int frameIndex = 0; frameIndex < totalFramesCount; frameIndex++) {
-                    BufferedImage rawFrame = decoder.getFrame(frameIndex);
+                    int rawWidth = decoder.getFrameWidth(frameIndex);
+                    int rawHeight = decoder.getFrameHeight(frameIndex);
+                    int[] rawPixels = decoder.getFramePixels(frameIndex);
 
-                    int drawW = totalWidth;
-                    int drawH = totalHeight;
-                    int offsetX = 0;
-                    int offsetY = 0;
+                    if (rawImage == null || rawImage.getWidth() != rawWidth || rawImage.getHeight() != rawHeight) {
+                        rawImage = new BufferedImage(rawWidth, rawHeight, BufferedImage.TYPE_INT_ARGB);
+                    }
+                    rawImage.setRGB(0, 0, rawWidth, rawHeight, rawPixels, 0, rawWidth);
 
-                    BufferedImage scaledImage = new BufferedImage(totalWidth, totalHeight, BufferedImage.TYPE_INT_ARGB);
-                    Graphics2D gFinal = scaledImage.createGraphics();
+                    gFinal.drawImage(rawImage, 0, 0, totalWidth, totalHeight, null);
 
-                    gFinal.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                    gFinal.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
-                    gFinal.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
-                    gFinal.setRenderingHint(RenderingHints.KEY_COLOR_RENDERING, RenderingHints.VALUE_COLOR_RENDER_QUALITY);
-
-                    gFinal.setComposite(AlphaComposite.Src);
-                    gFinal.drawImage(rawFrame, offsetX, offsetY, drawW, drawH, null);
-                    gFinal.dispose();
-
-                    int[] argbPixels = scaledImage.getRGB(0, 0, totalWidth, totalHeight, null, 0, totalWidth);
-                    byte[] ditheredColors = dither.applyDither(argbPixels, totalWidth, totalHeight, lut);
+                    scaledImage.getRGB(0, 0, totalWidth, totalHeight, argbPixels, 0, totalWidth);
+                    dither.applyDither(argbPixels, totalWidth, totalHeight, lut, ditheredColors);
 
                     final boolean firstFrame = (frameIndex == 0);
                     final int fIndex = frameIndex;
 
                     Map<Integer, MapFrameUpdate> frameUpdates = new ConcurrentHashMap<>();
 
-                    java.util.stream.IntStream.range(0, rows * columns).parallel().forEach(mapIndex -> {
-                        int row = mapIndex / columns;
-                        int col = mapIndex % columns;
-                        int mapId = virtualMapIds.get(mapIndex);
+                    try {
+                        java.util.stream.IntStream.range(0, rows * columns).parallel().forEach(mapIndex -> {
+                            int row = mapIndex / columns;
+                            int col = mapIndex % columns;
+                            int mapId = virtualMapIds.get(mapIndex);
 
-                        byte[] currentMapColors = extractMapArray(ditheredColors, totalWidth, col * 128, row * 128);
-                        byte[] prevMapColors = previousMapFrames[mapIndex];
-                        long cacheKey = ((long) fIndex << 32) | (mapId & 0xFFFFFFFFL);
+                            byte[] prevMap = prevMapFrames[mapIndex];
+                            byte[] currMap = currMapFrames[mapIndex];
 
-                        if (firstFrame) {
-                            ByteBuf packetBuf = PooledByteBufAllocator.DEFAULT.directBuffer(16384 + 16);
-                            writeVarInt(packetBuf, mapId);
-                            packetBuf.writeByte(0);
-                            packetBuf.writeBoolean(true);
-                            packetBuf.writeBoolean(false);
-                            packetBuf.writeByte(128);
-                            packetBuf.writeByte(128);
-                            packetBuf.writeByte(0);
-                            packetBuf.writeByte(0);
-                            writeVarInt(packetBuf, 16384);
-                            packetBuf.writeBytes(currentMapColors);
+                            if (firstFrame) {
+                                extractMapArray(ditheredColors, totalWidth, col * 128, row * 128, currMap);
+                                ByteBuf packetBuf = PooledByteBufAllocator.DEFAULT.directBuffer(16384 + 16);
+                                writeVarInt(packetBuf, mapId);
+                                packetBuf.writeByte(0);
+                                packetBuf.writeBoolean(true);
+                                packetBuf.writeBoolean(false);
+                                packetBuf.writeByte(128);
+                                packetBuf.writeByte(128);
+                                packetBuf.writeByte(0);
+                                packetBuf.writeByte(0);
+                                writeVarInt(packetBuf, 16384);
+                                packetBuf.writeBytes(currMap);
 
-                            DeltaFrame fullPart = new DeltaFrame(fIndex, mapId, packetBuf);
-                            MapFrameUpdate update = new MapFrameUpdate(new DeltaFrame[]{fullPart});
+                                DeltaFrame fullPart = new DeltaFrame(fIndex, mapId, packetBuf);
+                                MapFrameUpdate update = new MapFrameUpdate(new DeltaFrame[]{fullPart});
 
-                            preloadedMap.put(cacheKey, update);
-                            frameUpdates.put(mapId, update);
-                            previousMapFrames[mapIndex] = currentMapColors;
-                        } else {
-                            MapFrameUpdate update = calculateDelta(fIndex, mapId, prevMapColors, currentMapColors);
-                            if (update != null) {
                                 frameUpdates.put(mapId, update);
-                                previousMapFrames[mapIndex] = currentMapColors;
+                                firstFrameMap.put(mapId, update);
+
+                                currMapFrames[mapIndex] = prevMap;
+                                prevMapFrames[mapIndex] = currMap;
+                            } else {
+                                MapTileData tileData = extractMapArrayWithBounds(ditheredColors, totalWidth, col * 128, row * 128, prevMap, currMap);
+                                if (tileData.maxX != -1) {
+                                    MapFrameUpdate update = calculateDelta(fIndex, mapId, tileData.mapTile, tileData.minX, tileData.minY, tileData.maxX, tileData.maxY);
+                                    frameUpdates.put(mapId, update);
+                                }
+                                currMapFrames[mapIndex] = prevMap;
+                                prevMapFrames[mapIndex] = currMap;
+                            }
+                        });
+                    } catch (Exception e) {
+                        for (MapFrameUpdate update : frameUpdates.values()) {
+                            update.freeMemory();
+                        }
+                        throw e;
+                    }
+
+                    ioTasks.add(storage.saveBundledFrameAsync(syncGroupId, fIndex, frameUpdates).whenComplete((v, ex) -> {
+                        if (fIndex != 0) {
+                            for (MapFrameUpdate update : frameUpdates.values()) {
+                                update.freeMemory();
                             }
                         }
-                    });
-
-                    if (firstFrame) {
-                        ioTasks.add(CompletableFuture.runAsync(() -> {
-                            try { storage.saveBundledFrame(syncGroupId, fIndex, frameUpdates); }
-                            catch (Exception e) { e.printStackTrace(); }
-                        }, vtExecutor));
-                    } else {
-                        ioTasks.add(CompletableFuture.runAsync(() -> {
-                            try {
-                                storage.saveBundledFrame(syncGroupId, fIndex, frameUpdates);
-                                for (MapFrameUpdate update : frameUpdates.values()) update.freeMemory();
-                            } catch (Exception e) { e.printStackTrace(); }
-                        }, vtExecutor));
-                    }
+                    }));
 
                     if (progressCallback != null) {
                         progressCallback.accept((double) (frameIndex + 1) / totalFramesCount);
                     }
                 }
 
+                gFinal.dispose();
+
                 CompletableFuture.allOf(ioTasks.toArray(new CompletableFuture[0])).join();
 
             } catch (Exception e) {
                 throw new RuntimeException("Failed to process image stream: " + e.getMessage(), e);
             }
-
-            return preloadedMap;
+            return firstFrameMap;
         }, vtExecutor);
     }
 
-    private byte[] extractMapArray(byte[] fullGrid, int gridWidth, int startX, int startY) {
-        byte[] mapTile = new byte[16384];
+    private void extractMapArray(byte[] fullGrid, int gridWidth, int startX, int startY, byte[] outMapTile) {
         for (int y = 0; y < 128; y++) {
-            System.arraycopy(fullGrid, (startY + y) * gridWidth + startX, mapTile, y * 128, 128);
+            System.arraycopy(fullGrid, (startY + y) * gridWidth + startX, outMapTile, y * 128, 128);
         }
-        return mapTile;
     }
 
-    private MapFrameUpdate calculateDelta(int frameIndex, int mapId, byte[] prev, byte[] curr) {
+    private MapTileData extractMapArrayWithBounds(byte[] fullGrid, int gridWidth, int startX, int startY, byte[] prev, byte[] curr) {
         int minX = 128, minY = 128, maxX = -1, maxY = -1;
-
         for (int y = 0; y < 128; y++) {
+            int srcPos = (startY + y) * gridWidth + startX;
+            int destPos = y * 128;
+            System.arraycopy(fullGrid, srcPos, curr, destPos, 128);
             for (int x = 0; x < 128; x++) {
-                int idx = y * 128 + x;
-                if (prev[idx] != curr[idx]) {
+                if (curr[destPos + x] != prev[destPos + x]) {
                     if (x < minX) minX = x;
                     if (x > maxX) maxX = x;
                     if (y < minY) minY = y;
@@ -182,9 +203,10 @@ public class ImagePipeline {
                 }
             }
         }
+        return new MapTileData(curr, minX, minY, maxX, maxY);
+    }
 
-        if (maxX == -1) return null;
-
+    private MapFrameUpdate calculateDelta(int frameIndex, int mapId, byte[] curr, int minX, int minY, int maxX, int maxY) {
         int updateWidth = (maxX - minX) + 1;
         int updateHeight = (maxY - minY) + 1;
 
@@ -206,4 +228,6 @@ public class ImagePipeline {
         DeltaFrame part = new DeltaFrame(frameIndex, mapId, packetBuf);
         return new MapFrameUpdate(new DeltaFrame[]{part});
     }
+
+    private record MapTileData(byte[] mapTile, int minX, int minY, int maxX, int maxY) {}
 }

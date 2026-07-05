@@ -15,6 +15,7 @@ public class PacketSender {
 
     @NotNull
     public PacketWrapper<?> createMapPacket(@NotNull DeltaFrame delta) {
+        delta.retain();
         return new ZeroCopyMapWrapper(delta);
     }
 

@@ -13,7 +13,7 @@ public class BlueNoiseDither {
     private static final int MATRIX_MASK = MATRIX_SIZE - 1;
     private static final int[][] PRECALC_SPREAD = new int[MATRIX_SIZE][MATRIX_SIZE];
 
-    private final ForkJoinPool customPool = new ForkJoinPool(Math.max(1, Runtime.getRuntime().availableProcessors() - 1));
+    private final ForkJoinPool customPool;
 
     static {
         for (int y = 0; y < MATRIX_SIZE; y++) {
@@ -29,9 +29,11 @@ public class BlueNoiseDither {
     private static double fract(double val) { return val - Math.floor(val); }
     private static double ign(double x, double y) { return fract(52.9829189 * fract(0.06711056 * x + 0.00583715 * y)); }
 
-    public byte[] applyDither(int @NotNull [] pixels, int width, int height, @NotNull ColorPalette lut) {
-        byte[] outColors = new byte[pixels.length];
+    public BlueNoiseDither(@NotNull ForkJoinPool computePool) {
+        this.customPool = computePool;
+    }
 
+    public void applyDither(int @NotNull [] pixels, int width, int height, @NotNull ColorPalette lut, byte[] outColors) {
         try {
             customPool.submit(() -> IntStream.range(0, height).parallel().forEach(y -> {
                 int noiseY = y & MATRIX_MASK;
@@ -69,11 +71,7 @@ public class BlueNoiseDither {
         } catch (ExecutionException e) {
             throw new RuntimeException(e);
         }
-
-        return outColors;
     }
 
-    public void shutdown() {
-        customPool.shutdown();
-    }
+    public void shutdown() {}
 }

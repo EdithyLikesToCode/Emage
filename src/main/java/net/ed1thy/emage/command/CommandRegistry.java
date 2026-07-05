@@ -1,5 +1,7 @@
 package net.ed1thy.emage.command;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import io.github.retrooper.packetevents.util.SpigotConversionUtil;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import net.ed1thy.emage.Emage;
@@ -8,6 +10,7 @@ import net.ed1thy.emage.config.MessageManager;
 import net.ed1thy.emage.listener.ChunkTrackerListener;
 import net.ed1thy.emage.listener.FrameInteractListener;
 import net.ed1thy.emage.model.FrameNode;
+import net.ed1thy.emage.model.MapFrameUpdate;
 import net.ed1thy.emage.model.MapMetadata;
 import net.ed1thy.emage.network.ImageDownloader;
 import net.ed1thy.emage.processing.ImageFrameProvider;
@@ -34,11 +37,16 @@ import org.jetbrains.annotations.NotNull;
 
 import java.io.InputStream;
 import java.io.ByteArrayInputStream;
+import java.net.ConnectException;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
+import java.net.http.HttpTimeoutException;
 import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 public class CommandRegistry {
 
@@ -53,17 +61,17 @@ public class CommandRegistry {
     private final PacketSender packetSender;
     private final ChunkTrackerListener chunkTrackerListener;
     private final FrameInteractListener interactListener;
+    private final ExecutorService vtExecutor;
 
-    private final Map<UUID, Long> playerCooldowns = new ConcurrentHashMap<>();
+    private final Cache<UUID, Long> playerCooldowns;
     private final AtomicInteger activeProcessingTasks = new AtomicInteger(0);
-
-    private final ExecutorService vtExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
     public CommandRegistry(@NotNull Emage plugin, @NotNull ConfigManager configManager, @NotNull MessageManager messageManager,
                            @NotNull ImageDownloader imageDownloader, @NotNull MapMetadataRepository repository,
                            @NotNull ImagePipeline pipeline, @NotNull FlatFileStorage flatFileStorage,
                            @NotNull RenderManager renderManager, @NotNull PacketSender packetSender,
-                           @NotNull ChunkTrackerListener chunkTrackerListener, @NotNull FrameInteractListener interactListener) {
+                           @NotNull ChunkTrackerListener chunkTrackerListener, @NotNull FrameInteractListener interactListener,
+                           @NotNull ExecutorService vtExecutor) {
         this.plugin = plugin;
         this.configManager = configManager;
         this.messageManager = messageManager;
@@ -75,6 +83,10 @@ public class CommandRegistry {
         this.packetSender = packetSender;
         this.chunkTrackerListener = chunkTrackerListener;
         this.interactListener = interactListener;
+        this.vtExecutor = vtExecutor;
+        this.playerCooldowns = Caffeine.newBuilder()
+                .expireAfterWrite(configManager.cooldownSeconds + 60, TimeUnit.SECONDS)
+                .build();
     }
 
     public void registerCommands() {
@@ -113,12 +125,14 @@ public class CommandRegistry {
         );
 
         commandManager.command(builder.literal("remove")
+                .optional("syncGroupId", IntegerParser.integerParser())
                 .handler(ctx -> {
                     if (!(ctx.sender().getSender() instanceof Player player)) {
                         messageManager.sendOnlyPlayers(ctx.sender().getSender());
                         return;
                     }
-                    Bukkit.getScheduler().runTask(plugin, () -> handleRemoveSync(player));
+                    int syncGroupId = ctx.getOrDefault("syncGroupId", -1);
+                    Bukkit.getScheduler().runTask(plugin, () -> handleRemoveSync(player, syncGroupId));
                 })
         );
 
@@ -132,18 +146,22 @@ public class CommandRegistry {
         );
     }
 
+    private long getBlockKey(int x, int y, int z) {
+        return ((long) x & 0x3FFFFFFL) << 38 | ((long) z & 0x3FFFFFFL) << 12 | ((long) y & 0xFFFL);
+    }
+
     private List<ItemFrame> findContiguousEmageFrames(ItemFrame start, List<Integer> validMapIds) {
         List<ItemFrame> result = new ArrayList<>();
 
         int estimatedRadius = (int) Math.ceil(Math.sqrt(validMapIds.size())) + 2;
 
-        Map<String, ItemFrame> cache = new HashMap<>();
+        Map<Long, ItemFrame> cache = new HashMap<>();
         for (Entity entity : start.getWorld().getNearbyEntities(start.getLocation(), estimatedRadius, estimatedRadius, estimatedRadius)) {
             if (entity instanceof ItemFrame f && f.getFacing() == start.getFacing()) {
                 if (f.getPersistentDataContainer().has(interactListener.getEmageKey(), PersistentDataType.INTEGER)) {
                     int mapId = f.getPersistentDataContainer().get(interactListener.getEmageKey(), PersistentDataType.INTEGER);
                     if (validMapIds.contains(mapId)) {
-                        cache.put(f.getLocation().getBlockX() + "," + f.getLocation().getBlockY() + "," + f.getLocation().getBlockZ(), f);
+                        cache.put(getBlockKey(f.getLocation().getBlockX(), f.getLocation().getBlockY(), f.getLocation().getBlockZ()), f);
                     }
                 }
             }
@@ -182,8 +200,8 @@ public class CommandRegistry {
         return result;
     }
 
-    private void checkNeighbor(Map<String, ItemFrame> cache, Set<UUID> visited, Queue<ItemFrame> queue, int x, int y, int z) {
-        ItemFrame neighbor = cache.get(x + "," + y + "," + z);
+    private void checkNeighbor(Map<Long, ItemFrame> cache, Set<UUID> visited, Queue<ItemFrame> queue, int x, int y, int z) {
+        ItemFrame neighbor = cache.get(getBlockKey(x, y, z));
         if (neighbor != null && !visited.contains(neighbor.getUniqueId())) {
             queue.add(neighbor);
         }
@@ -195,7 +213,8 @@ public class CommandRegistry {
             return;
         }
 
-        long lastRenderTime = playerCooldowns.getOrDefault(player.getUniqueId(), 0L);
+        Long lastRenderTimeObj = playerCooldowns.getIfPresent(player.getUniqueId());
+        long lastRenderTime = lastRenderTimeObj == null ? 0L : lastRenderTimeObj;
         if (System.currentTimeMillis() - lastRenderTime < (configManager.cooldownSeconds * 1000L)) {
             messageManager.sendCooldownActive(player);
             return;
@@ -220,6 +239,22 @@ public class CommandRegistry {
                         Bukkit.getScheduler().runTask(plugin, () -> {
                             SyncGroup group = renderManager.getSyncGroup(meta.syncGroupID());
                             List<ItemFrame> wallFrames = findContiguousEmageFrames(clickedFrame, groupMapIds);
+                            Set<UUID> wallFrameUuids = wallFrames.stream().map(Entity::getUniqueId).collect(Collectors.toSet());
+
+                            GridUtil.GridData gridData;
+                            try {
+                                gridData = GridUtil.detectGrid(clickedFrame, inputColumns, inputRows, configManager.maxImageGridSize, f -> wallFrameUuids.contains(f.getUniqueId()));
+                                if (gridData == null) {
+                                    if (inputColumns == -1) messageManager.sendAutoDetectFailed(player);
+                                    else messageManager.sendNotEnoughFrames(player, inputColumns, inputRows);
+                                    return;
+                                }
+                            } catch (GridUtil.MissingFrameException e) {
+                                spawnMissingParticle(player, clickedFrame, e);
+                                if (inputColumns == -1) messageManager.sendAutoDetectFailed(player);
+                                else messageManager.sendNotEnoughFrames(player, inputColumns, inputRows);
+                                return;
+                            }
 
                             for (ItemFrame f : wallFrames) {
                                 f.getPersistentDataContainer().remove(interactListener.getEmageKey());
@@ -248,19 +283,38 @@ public class CommandRegistry {
                                 }
                             });
 
-                            startImagePipeline(player, url, inputColumns, inputRows, clickedFrame);
+                            startImagePipeline(player, url, gridData);
                         });
                     } else {
-                        Bukkit.getScheduler().runTask(plugin, () -> startImagePipeline(player, url, inputColumns, inputRows, clickedFrame));
+                        Bukkit.getScheduler().runTask(plugin, () -> detectAndStartPipeline(player, url, inputColumns, inputRows, clickedFrame));
                     }
                 } catch (Exception e) {
                     plugin.getLogger().warning("Failed to clean up old grid during overwrite: " + e.getMessage());
-                    Bukkit.getScheduler().runTask(plugin, () -> startImagePipeline(player, url, inputColumns, inputRows, clickedFrame));
+                    Bukkit.getScheduler().runTask(plugin, () -> detectAndStartPipeline(player, url, inputColumns, inputRows, clickedFrame));
                 }
             });
         } else {
-            startImagePipeline(player, url, inputColumns, inputRows, clickedFrame);
+            detectAndStartPipeline(player, url, inputColumns, inputRows, clickedFrame);
         }
+    }
+
+    private void detectAndStartPipeline(Player player, String url, int inputColumns, int inputRows, ItemFrame clickedFrame) {
+        GridUtil.GridData gridData;
+        try {
+            gridData = GridUtil.detectGrid(clickedFrame, inputColumns, inputRows, configManager.maxImageGridSize, f ->
+                    f.getItem().getType() == Material.AIR && !f.getPersistentDataContainer().has(interactListener.getEmageKey(), PersistentDataType.INTEGER));
+            if (gridData == null) {
+                if (inputColumns == -1) messageManager.sendAutoDetectFailed(player);
+                else messageManager.sendNotEnoughFrames(player, inputColumns, inputRows);
+                return;
+            }
+        } catch (GridUtil.MissingFrameException e) {
+            spawnMissingParticle(player, clickedFrame, e);
+            if (inputColumns == -1) messageManager.sendAutoDetectFailed(player);
+            else messageManager.sendNotEnoughFrames(player, inputColumns, inputRows);
+            return;
+        }
+        startImagePipeline(player, url, gridData);
     }
 
     private void spawnMissingParticle(Player player, ItemFrame frame, GridUtil.MissingFrameException e) {
@@ -279,7 +333,7 @@ public class CommandRegistry {
         });
     }
 
-    private void finalizeFrameApplication(Player player, List<ItemFrame> gridFrames, MapMetadata meta, List<Integer> mapIds, int columns, int rows, net.ed1thy.emage.model.MapFrameUpdate dummy, Map<Long, net.ed1thy.emage.model.MapFrameUpdate> processedFrames, Runnable decrementTask) {
+    private void finalizeFrameApplication(Player player, List<ItemFrame> gridFrames, MapMetadata meta, List<Integer> mapIds, int columns, int rows, Map<Integer, MapFrameUpdate> baseFrame, Runnable decrementTask) {
         try {
             List<FrameNode> nodes = new ArrayList<>();
             com.github.retrooper.packetevents.protocol.player.User user = com.github.retrooper.packetevents.PacketEvents.getAPI().getPlayerManager().getUser(player);
@@ -324,7 +378,7 @@ public class CommandRegistry {
 
             SyncGroup group = renderManager.getSyncGroup(meta.syncGroupID());
             if (group == null) {
-                group = new SyncGroup(meta, new CopyOnWriteArrayList<>(nodes), flatFileStorage, configManager, processedFrames);
+                group = new SyncGroup(meta, new CopyOnWriteArrayList<>(nodes), flatFileStorage, renderManager.getGlobalFrameCache(), vtExecutor, baseFrame);
                 final SyncGroup finalGroup = group;
                 Bukkit.getScheduler().runTaskLater(plugin, () -> {
                     renderManager.registerSyncGroup(meta.syncGroupID(), finalGroup);
@@ -334,28 +388,36 @@ public class CommandRegistry {
             }
 
             messageManager.sendActionBar(player, "");
-            messageManager.sendSuccess(player, columns * rows);
+            messageManager.sendSuccess(player, columns * rows, meta.syncGroupID());
         } finally {
             decrementTask.run();
         }
     }
 
-    private void startImagePipeline(Player player, String url, int inputColumns, int inputRows, ItemFrame clickedFrame) {
-        GridUtil.GridData gridData;
-        try {
-            gridData = GridUtil.detectGrid(clickedFrame, inputColumns, inputRows, configManager.maxImageGridSize);
-            if (gridData == null) {
-                if (inputColumns == -1) messageManager.sendAutoDetectFailed(player);
-                else messageManager.sendNotEnoughFrames(player, inputColumns, inputRows);
-                return;
-            }
-        } catch (GridUtil.MissingFrameException e) {
-            spawnMissingParticle(player, clickedFrame, e);
-            if (inputColumns == -1) messageManager.sendAutoDetectFailed(player);
-            else messageManager.sendNotEnoughFrames(player, inputColumns, inputRows);
-            return;
+    private String getFriendlyErrorMessage(Throwable throwable) {
+        Throwable cause = throwable;
+        while (cause.getCause() != null) {
+            cause = cause.getCause();
         }
 
+        if (cause instanceof UnknownHostException) {
+            return "Could not find the server. Check the URL or your internet connection.";
+        } else if (cause instanceof HttpTimeoutException || cause instanceof SocketTimeoutException) {
+            return "The server took too long to respond. It may be offline or overloaded.";
+        } else if (cause instanceof ConnectException) {
+            return "Failed to connect to the server. The host may be down or blocking connections.";
+        } else if (cause instanceof javax.net.ssl.SSLException) {
+            return "An SSL/TLS error occurred. The website's certificate may be invalid or unsupported.";
+        } else if (cause instanceof SecurityException) {
+            return cause.getMessage();
+        } else if (cause instanceof java.io.IOException && cause.getMessage() != null && cause.getMessage().contains("Download size limit exceeded")) {
+            return cause.getMessage();
+        }
+
+        return cause.getMessage() != null ? cause.getMessage() : "An unknown error occurred.";
+    }
+
+    private void startImagePipeline(Player player, String url, GridUtil.GridData gridData) {
         int finalColumns = gridData.columns();
         int finalRows = gridData.rows();
         List<ItemFrame> gridFrames = gridData.frames();
@@ -391,7 +453,7 @@ public class CommandRegistry {
                     List<Integer> mapIds = repository.getMapIdsForGroup(meta.syncGroupID());
 
                     Bukkit.getScheduler().runTask(plugin, () -> {
-                        finalizeFrameApplication(player, gridFrames, meta, mapIds, finalColumns, finalRows, null, null, decrementTask);
+                        finalizeFrameApplication(player, gridFrames, meta, mapIds, finalColumns, finalRows, null, decrementTask);
                     });
                     return;
                 }
@@ -401,7 +463,8 @@ public class CommandRegistry {
 
             imageDownloader.downloadImageStream(url).whenComplete((inputStream, throwable) -> {
                 if (throwable != null) {
-                    messageManager.sendError(player, throwable.getMessage());
+                    String friendlyError = getFriendlyErrorMessage(throwable);
+                    messageManager.sendError(player, friendlyError);
                     messageManager.sendActionBar(player, "");
                     revertLoadingSpinner(gridFrames);
                     decrementTask.run();
@@ -415,6 +478,8 @@ public class CommandRegistry {
                 CompletableFuture.runAsync(() -> {
                     try {
                         byte[] imageBytes = inputStream.readAllBytes();
+                        closeStreamQuietly(inputStream);
+
                         MessageDigest md = MessageDigest.getInstance("MD5");
                         byte[] hashBytes = md.digest(imageBytes);
                         StringBuilder sb = new StringBuilder();
@@ -428,7 +493,7 @@ public class CommandRegistry {
                             List<Integer> mapIds = repository.getMapIdsForGroup(meta.syncGroupID());
 
                             Bukkit.getScheduler().runTask(plugin, () -> {
-                                finalizeFrameApplication(player, gridFrames, meta, mapIds, finalColumns, finalRows, null, null, decrementTask);
+                                finalizeFrameApplication(player, gridFrames, meta, mapIds, finalColumns, finalRows, null, decrementTask);
                             });
                             return;
                         }
@@ -491,7 +556,7 @@ public class CommandRegistry {
                         pipeline.processStreamAsync(provider, meta.syncGroupID(), mapIds, finalColumns, finalRows, progress -> {
                             int percent = (int) Math.round(progress * 100);
                             messageManager.sendActionBar(player, "<color:#4CABBB>Processing Frames: <white>" + percent + "%</white></color>");
-                        }).whenComplete((processedFrames, err) -> {
+                        }).whenComplete((baseFrame, err) -> {
                             if (err != null) {
                                 err.printStackTrace();
                                 messageManager.sendProcessError(player, err.getMessage());
@@ -502,7 +567,7 @@ public class CommandRegistry {
                             }
 
                             Bukkit.getScheduler().runTask(plugin, () -> {
-                                finalizeFrameApplication(player, gridFrames, meta, mapIds, finalColumns, finalRows, null, processedFrames, decrementTask);
+                                finalizeFrameApplication(player, gridFrames, meta, mapIds, finalColumns, finalRows, baseFrame, decrementTask);
                             });
                         });
 
@@ -518,7 +583,7 @@ public class CommandRegistry {
         });
     }
 
-    private void handleRemoveSync(Player player) {
+    private void handleRemoveSync(Player player, int expectedSyncGroupId) {
         Entity target = player.getTargetEntity(10);
         if (!(target instanceof ItemFrame clickedFrame)) {
             messageManager.sendNoFrame(player);
@@ -536,11 +601,22 @@ public class CommandRegistry {
             try {
                 Optional<MapMetadata> metaOpt = repository.getMetadataByMapId(mapId);
                 if (metaOpt.isEmpty()) {
-                    messageManager.sendMetadataNotFound(player);
+                    Bukkit.getScheduler().runTask(plugin, () -> {
+                        clickedFrame.getPersistentDataContainer().remove(interactListener.getEmageKey());
+                        clickedFrame.setItem(new ItemStack(Material.AIR));
+                        clickedFrame.setVisible(true);
+                        messageManager.sendGridRemoved(player);
+                    });
                     return;
                 }
 
                 MapMetadata meta = metaOpt.get();
+
+                if (expectedSyncGroupId != -1 && meta.syncGroupID() != expectedSyncGroupId) {
+                    messageManager.sendUndoMismatch(player);
+                    return;
+                }
+
                 List<Integer> groupMapIds = repository.getMapIdsForGroup(meta.syncGroupID());
 
                 Bukkit.getScheduler().runTask(plugin, () -> {
@@ -589,4 +665,6 @@ public class CommandRegistry {
             try { stream.close(); } catch (Exception ignored) {}
         }
     }
+
+    public void shutdown() {}
 }

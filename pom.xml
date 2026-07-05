@@ -6,7 +6,7 @@
 
     <groupId>net.ed1thy</groupId>
     <artifactId>Emage</artifactId>
-    <version>1.5.2</version>
+    <version>1.5.3</version>
     <packaging>jar</packaging>
 
     <name>Emage</name>
@@ -85,6 +85,16 @@
             <resource>
                 <directory>src/main/resources</directory>
                 <filtering>true</filtering>
+                <excludes>
+                    <exclude>**/*.bin</exclude>
+                </excludes>
+            </resource>
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>false</filtering>
+                <includes>
+                    <include>**/*.bin</include>
+                </includes>
             </resource>
         </resources>
     </build>
